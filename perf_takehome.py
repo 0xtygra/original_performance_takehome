@@ -82,7 +82,8 @@ class KernelBuilder:
                     instrs[instrs_len - 1][engine].append(slot)
                     # curr_dests irrelevant for store i believe, we can overwrite
                     # curr_dests[engine][slot[2]] = True
-
+                elif engine == "load" and curr_engine_len < SLOT_LIMITS[engine]:
+                    instrs[instrs_len - 1][engine].append(slot)
                 else:
                     instrs.append({engine: [slot]})
                     curr_dests[engine] = {slot[1]: True}
