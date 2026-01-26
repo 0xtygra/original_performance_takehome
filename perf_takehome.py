@@ -51,8 +51,55 @@ class KernelBuilder:
     def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
         # Simple slot packing that just uses one slot per instruction bundle
         instrs = []
+        instrs_len = 0
+        curr_dests = {"alu": {}, "store": {}, "load": {}, "flow": {}}
+        prev_engine = None
+        # NEXT THING TO DO
+        # BE ABLE TO HANDLE ALU -> LOAD -> ALU INTO 1 CYCLE
+        # additionally be able to handle ALU -> load -> load -> load -> ALU if none of the ALUs depend on the loads, even if the interim loads are multiple cycles on their own
         for engine, slot in slots:
-            instrs.append({engine: [slot]})
+            if instrs_len == 0:
+                instrs.append({engine: [slot]})
+                curr_dests = {engine: {slot[1]: True}}
+                instrs_len += 1
+                continue
+            curr_engine_len = (
+                0
+                if engine not in instrs[instrs_len - 1]
+                else len(instrs[instrs_len - 1][engine])
+            )
+            if prev_engine == engine:
+                if engine == "alu" and curr_engine_len < SLOT_LIMITS[engine]:
+                    # simple for now - ensure that the instr we want to pack into the same cycle doesnt depend on the write from the prev alu
+                    if (
+                        slot[2] not in curr_dests[engine]
+                        and slot[3] not in curr_dests[engine]
+                    ):
+                        instrs[instrs_len - 1][engine].append(slot)
+                        curr_dests[engine][slot[1]] = True
+
+                elif engine == "store" and curr_engine_len < SLOT_LIMITS[engine]:
+                    instrs[instrs_len - 1][engine].append(slot)
+                    # curr_dests irrelevant for store i believe, we can overwrite
+                    # curr_dests[engine][slot[2]] = True
+
+                else:
+                    instrs.append({engine: [slot]})
+                    curr_dests[engine] = {slot[1]: True}
+                    instrs_len += 1
+
+            new_engine_len = (
+                0
+                if engine not in instrs[instrs_len - 1]
+                else len(instrs[instrs_len - 1][engine])
+            )
+            # we werent able to add new instr into current cycle
+            if curr_engine_len == new_engine_len:
+                instrs.append({engine: [slot]})
+                curr_dests = {engine: {slot[1]: True}}
+                instrs_len += 1
+            prev_engine = engine
+
         return instrs
 
     def add(self, engine, slot):
@@ -77,11 +124,15 @@ class KernelBuilder:
     def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
         slots = []
 
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+        for hi, (op1, val1, op2, op3, val3) in enumerate[
+            tuple[str, int, str, str, int]
+        ](HASH_STAGES):
             slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
             slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
             slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
-            slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
+            slots.append(
+                ("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi)))
+            )
 
         return slots
 
@@ -130,22 +181,45 @@ class KernelBuilder:
         tmp_val = self.alloc_scratch("tmp_val")
         tmp_node_val = self.alloc_scratch("tmp_node_val")
         tmp_addr = self.alloc_scratch("tmp_addr")
+        tmp_addr_2 = self.alloc_scratch("tmp_addr_2")
+        tmp_val_2 = self.alloc_scratch("tmp_val")
+
+        tmp_addr_3 = self.alloc_scratch("tmp_addr_3")
+        tmp_val_3 = self.alloc_scratch("tmp_val")
+
+        tmp_addr_4 = self.alloc_scratch("tmp_addr_4")
+        tmp_val_4 = self.alloc_scratch("tmp_val")
 
         for round in range(rounds):
             for i in range(batch_size):
                 i_const = self.scratch_const(i)
                 # idx = mem[inp_indices_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
+                # IM COMBINING THESE HERE TO LEVERAGE THE LOGIC WE HAVE IN BUILD THAT
+                # PUTS MULTIPLE ALU INSTRUCTIONS INTO 1 CYCLE IF THEY DONT REFERENCE EACH OTHER
+                # BUT IT WILL ONLY DO IT FOR CONTIGUOUS BLOCKS OF ALU OPERATIONS
+                # WORK ON BUILD TO LOOK AHEAD AND ONLY COMPLETE A CYCLE WHEN IT GETS TO
+                # AN OPERATION THAT RELIES IN THE CURRENT CYCLE
+                # THEN SEE IF WE CAN UNDO THIS CONTIGUOUS CHANGE BELOW AND MOVE THE 2ND ALU BACK TO BEFORE THE LOAD
+                # FOR TMP_ADDR_2
+                body.append(
+                    ("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const))
+                )
+                body.append(
+                    ("alu", ("+", tmp_addr_2, self.scratch["inp_values_p"], i_const))
+                )
                 body.append(("load", ("load", tmp_idx, tmp_addr)))
                 body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
                 # val = mem[inp_values_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("load", ("load", tmp_val, tmp_addr)))
+                body.append(("load", ("load", tmp_val, tmp_addr_2)))
                 body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
                 # node_val = mem[forest_values_p + idx]
-                body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
-                body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
+                body.append(
+                    ("alu", ("+", tmp_addr_3, self.scratch["forest_values_p"], tmp_idx))
+                )
+                body.append(("load", ("load", tmp_node_val, tmp_addr_3)))
+                body.append(
+                    ("debug", ("compare", tmp_node_val, (round, i, "node_val")))
+                )
                 # val = myhash(val ^ node_val)
                 body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
                 body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
@@ -162,18 +236,24 @@ class KernelBuilder:
                 body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
                 body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
                 # mem[inp_indices_p + i] = idx
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
+                body.append(
+                    ("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const))
+                )
+                body.append(
+                    ("alu", ("+", tmp_addr_2, self.scratch["inp_values_p"], i_const))
+                )
                 body.append(("store", ("store", tmp_addr, tmp_idx)))
                 # mem[inp_values_p + i] = val
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_val)))
+                body.append(("store", ("store", tmp_addr_2, tmp_val)))
 
         body_instrs = self.build(body)
         self.instrs.extend(body_instrs)
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
 
+
 BASELINE = 147734
+
 
 def do_kernel_test(
     forest_height: int,
