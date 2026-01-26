@@ -183,13 +183,8 @@ class KernelBuilder:
         tmp_node_val = self.alloc_scratch("tmp_node_val")
         tmp_addr = self.alloc_scratch("tmp_addr")
         tmp_addr_2 = self.alloc_scratch("tmp_addr_2")
-        tmp_val_2 = self.alloc_scratch("tmp_val")
-
         tmp_addr_3 = self.alloc_scratch("tmp_addr_3")
-        tmp_val_3 = self.alloc_scratch("tmp_val")
-
-        tmp_addr_4 = self.alloc_scratch("tmp_addr_4")
-        tmp_val_4 = self.alloc_scratch("tmp_val")
+        tmp_vec_1 = self.alloc_scratch("tmp_vec_1", VLEN)
 
         for round in range(rounds):
             for i in range(batch_size):
