@@ -83,14 +83,15 @@ class KernelBuilder:
                     ):
                         instrs[instrs_len - 1][engine].append(slot)
                         curr_dests[engine][slot[1]] = True
-                elif engine == "valu" and curr_engine_len < SLOT_LIMITS[engine]:
-                    # simple for now - ensure that the instr we want to pack into the same cycle doesnt depend on the write from the prev alu
-                    if (
-                        slot[2] not in curr_dests[engine]
-                        and slot[3] not in curr_dests[engine]
-                    ):
-                        instrs[instrs_len - 1][engine].append(slot)
-                        curr_dests[engine][slot[1]] = True
+                # COMMENTED OUT AS NOT WORKING WITH MULTIPLYADD
+                # elif engine == "valu" and curr_engine_len < SLOT_LIMITS[engine]:
+                #     # simple for now - ensure that the instr we want to pack into the same cycle doesnt depend on the write from the prev alu
+                #     if (
+                #         slot[2] not in curr_dests[engine]
+                #         and slot[3] not in curr_dests[engine]
+                #     ):
+                #         instrs[instrs_len - 1][engine].append(slot)
+                #         curr_dests[engine][slot[1]] = True
                 elif engine == "store" and curr_engine_len < SLOT_LIMITS[engine]:
                     instrs[instrs_len - 1][engine].append(slot)
                     # curr_dests irrelevant for store i believe, we can overwrite
@@ -321,9 +322,9 @@ class KernelBuilder:
 
                 # muladd?
                 body.append(
-                    ("valu", ("*", tmp_vec_idx, tmp_vec_idx, two_vec_const)))
-                body.append(
-                    ("valu", ("+", tmp_vec_idx, tmp_vec_idx, tmp_vec_1)))
+                    ("valu", ("multiply_add", tmp_vec_idx, tmp_vec_idx, two_vec_const, tmp_vec_1)))
+                # body.append(
+                #     ("valu", ("+", tmp_vec_idx, tmp_vec_idx, tmp_vec_1)))
                 body.append(
                     (
                         "debug",
