@@ -167,7 +167,7 @@ class KernelBuilder:
         return self.vconst_map[val]
 
     def build_hash(self, val_vec_hash_addr, tmp_vec_1, tmp_vec_2, round, i):
-        for hi, (op1, val1, op2, op3, val3) in enumerate[
+        for hash_index, (op1, val1, op2, op3, val3) in enumerate[
             tuple[str, int, str, str, int]
         ](HASH_STAGES):
             self.instrs.append({
@@ -182,7 +182,8 @@ class KernelBuilder:
             self.add("debug", (
                 "vcompare",
                 val_vec_hash_addr,
-                [(round, i + j, "hash_stage", hi) for j in range(VLEN)],
+                [(round, i + j, "hash_stage", hash_index)
+                 for j in range(VLEN)],
             ))
 
     def build_kernel(
@@ -235,10 +236,9 @@ class KernelBuilder:
         tmp_addr_2 = self.alloc_scratch("tmp_addr_2")
         tmp_vec_1 = self.alloc_scratch("tmp_vec_1", VLEN)
         tmp_vec_2 = self.alloc_scratch("tmp_vec_2", VLEN)
-        tmp_vec_3 = self.alloc_scratch("tmp_vec_3", VLEN)
-        tmp_vec_idx = self.alloc_scratch("tmp_vec_idx", VLEN)
-        tmp_vec_val = self.alloc_scratch("tmp_vec_val", VLEN)
-        tmp_vec_node_val = self.alloc_scratch("tmp_vec_node_val", VLEN)
+        # stores the 8 disparate forest values for our current batch
+        forest_values_p_vec = self.alloc_scratch("forest_values_vec", VLEN)
+        forest_values_vec = self.alloc_scratch("tmp_vec_node_val", VLEN)
         # vec_batch_is = self.alloc_scratch("vec_batch_is", batch_size)
         # for i in range(batch_size):
         #         self.add("load", ("const", tmp1, i))
@@ -277,6 +277,8 @@ class KernelBuilder:
             ("vload", input_values + final_offset, tmp_addr_2)
         ]})
         # theoretically at this point we now have all of our input indices and values in 2 256 contiguous blocks of memory
+        
+        
 
         for round in range(rounds):
             for i in range(0, batch_size, VLEN):
@@ -288,7 +290,7 @@ class KernelBuilder:
                         (round, i + j, "val") for j in range(VLEN)])
                 ]})
                 # node_val = mem[forest_values_p + idx]
-                self.add("valu", ("+", tmp_vec_3,
+                self.add("valu", ("+", forest_values_p_vec,
                          self.scratch["forest_values_p"], input_indices+i))
                 # how can i remove this loop? this loop results in 4 cycles per loop = 4 * 16 (rounds) * 256/8 (batch size/vlen) = 2000 cycles
                 # what are we doing here? loading 8 disparate forest values into memory in order to operate on the 8 long vec of them
@@ -299,15 +301,15 @@ class KernelBuilder:
                 # but vload loads a block of 8 contiguous values from main memory into scratch
                 for k in range(0, VLEN, 2):
                     self.instrs.append({"load": [
-                        ("load", tmp_vec_node_val + k, tmp_vec_3 + k),
-                        ("load", tmp_vec_node_val + k+1, tmp_vec_3 + k+1)
+                        ("load", forest_values_vec + k, forest_values_p_vec + k),
+                        ("load", forest_values_vec + k+1, forest_values_p_vec + k+1)
                     ]})
 
-                self.add("debug", ("vcompare", tmp_vec_node_val, [
+                self.add("debug", ("vcompare", forest_values_vec, [
                          (round, i + j, "node_val") for j in range(VLEN)]))
                 # val = myhash(val ^ node_val)
                 self.add("valu", ("^", input_values + i,
-                         input_values + i, tmp_vec_node_val))
+                         input_values + i, forest_values_vec))
                 self.build_hash(input_values + i, tmp_vec_1,
                                 tmp_vec_2, round, i)
                 self.add("debug", ("vcompare", input_values + i, [
@@ -322,12 +324,19 @@ class KernelBuilder:
                 self.add("debug", ("vcompare", input_indices+i, [
                          (round, i + j, "next_idx") for j in range(VLEN)]))
                 # idx = 0 if idx >= n_nodes else idx
+                # WHAT IS THE IDX VALUE CUTOFF FOR WRAPPING?
+                # 2*idx + 2 >= n_nodes -> idx >= 1/2 * n_nodes - 1 IF VALUE IS EVEN
+                # if n_nodes is 1000
+                # idx 499 -> 999 = no wrap
+                # idx 498 -> 996 + 2 = no wrap
+                # idx 500 -> wrap
                 self.add("valu", ("<", tmp_vec_1, input_indices+i,
                          self.scratch["n_nodes"]))
                 self.add("flow", ("vselect", input_indices+i,
                          tmp_vec_1, input_indices+i, zero_vec_const))
                 self.add("debug", ("vcompare", input_indices+i, [
                          (round, i + j, "wrapped_idx") for j in range(VLEN)]))
+
                 # mem[inp_indices_p + i] = idx
 
         # Required to match with the yield in reference_kernel2
