@@ -282,20 +282,14 @@ class KernelBuilder:
             for i in range(0, batch_size, VLEN):
                 i_const = self.scratch_const(i)
                 # idx = mem[inp_indices_p + i]
-                # self.add("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const))
-                # self.add("alu", ("+", tmp_addr_2, self.scratch["inp_values_p"], i_const))
-                self.instrs.append({"alu": [("+", tmp_addr, self.scratch["inp_indices_p"],
-                                   i_const), ("+", tmp_addr_2, self.scratch["inp_values_p"], i_const)]})
-                self.instrs.append(
-                    {"load": [("vload", tmp_vec_idx, tmp_addr), ("vload", tmp_vec_val, tmp_addr_2)]})
-                self.instrs.append({"debug": [("vcompare", tmp_vec_idx, [
+                self.instrs.append({"debug": [("vcompare", input_indices + i, [
                     (round, i + j, "idx") for j in range(VLEN)]),
-                    ("vcompare", tmp_vec_val, [
+                    ("vcompare", input_values + i, [
                         (round, i + j, "val") for j in range(VLEN)])
                 ]})
                 # node_val = mem[forest_values_p + idx]
                 self.add("valu", ("+", tmp_vec_3,
-                         self.scratch["forest_values_p"], tmp_vec_idx))
+                         self.scratch["forest_values_p"], input_indices+i))
                 # how can i remove this loop? this loop results in 4 cycles per loop = 4 * 16 (rounds) * 256/8 (batch size/vlen) = 2000 cycles
                 # what are we doing here? loading 8 disparate forest values into memory in order to operate on the 8 long vec of them
                 # when we hash
@@ -312,51 +306,54 @@ class KernelBuilder:
                 self.add("debug", ("vcompare", tmp_vec_node_val, [
                          (round, i + j, "node_val") for j in range(VLEN)]))
                 # val = myhash(val ^ node_val)
-                self.add("valu", ("^", tmp_vec_val,
-                         tmp_vec_val, tmp_vec_node_val))
-                self.build_hash(tmp_vec_val, tmp_vec_1, tmp_vec_2, round, i)
-                self.add("debug", ("vcompare", tmp_vec_val, [
+                self.add("valu", ("^", input_values + i,
+                         input_values + i, tmp_vec_node_val))
+                self.build_hash(input_values + i, tmp_vec_1,
+                                tmp_vec_2, round, i)
+                self.add("debug", ("vcompare", input_values + i, [
                          (round, i + j, "hashed_val") for j in range(VLEN)]))
                 # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                # self.instrs.append({
-                #     "valu"
-                # })
-                self.add("valu", ("%", tmp_vec_1, tmp_vec_val, two_vec_const))
+                self.add("valu", ("%", tmp_vec_1,
+                         input_values + i, two_vec_const))
                 self.add("valu", ("+", tmp_vec_1, tmp_vec_1, one_vec_const))
                 # muladd
-                self.add("valu", ("multiply_add", tmp_vec_idx,
-                         tmp_vec_idx, two_vec_const, tmp_vec_1))
-                self.add("debug", ("vcompare", tmp_vec_idx, [
+                self.add("valu", ("multiply_add", input_indices+i,
+                         input_indices+i, two_vec_const, tmp_vec_1))
+                self.add("debug", ("vcompare", input_indices+i, [
                          (round, i + j, "next_idx") for j in range(VLEN)]))
                 # idx = 0 if idx >= n_nodes else idx
-                self.add("valu", ("<", tmp_vec_1, tmp_vec_idx,
+                self.add("valu", ("<", tmp_vec_1, input_indices+i,
                          self.scratch["n_nodes"]))
-                self.add("flow", ("vselect", tmp_vec_idx,
-                         tmp_vec_1, tmp_vec_idx, zero_vec_const))
-                self.add("debug", ("vcompare", tmp_vec_idx, [
+                self.add("flow", ("vselect", input_indices+i,
+                         tmp_vec_1, input_indices+i, zero_vec_const))
+                self.add("debug", ("vcompare", input_indices+i, [
                          (round, i + j, "wrapped_idx") for j in range(VLEN)]))
                 # mem[inp_indices_p + i] = idx
-                # self.add(
-                #     "alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const))
-                # self.add("alu", ("+", tmp_addr_2,
-                #          self.scratch["inp_values_p"], i_const))
-                self.instrs.append({
-                    "store": [
-                        ("vstore", tmp_addr, tmp_vec_idx),
-                        ("vstore", tmp_addr_2, tmp_vec_val)
-                    ]
-                })
-                # self.instrs.append({
-                #     "store": [
-                #         ("vstore", tmp_addr, tmp_vec_idx),
-                #         ("vstore", tmp_addr_2, tmp_vec_val)
-                #     ]
-                # })
-                # self.add("store", ("vstore", tmp_addr, tmp_vec_idx))
-                # # mem[inp_values_p + i] = val
-                # self.add("store", ("vstore", tmp_addr_2, tmp_vec_val))
 
         # Required to match with the yield in reference_kernel2
+        i_const = self.scratch_const(0)
+        self.instrs.append({"alu": [("+", tmp_addr, self.scratch["inp_indices_p"],
+                                     i_const), ("+", tmp_addr_2, self.scratch["inp_values_p"], i_const)]})
+
+        # WE NEED TO VSTORE AT THE input_indices_p and input_values_p
+        # now we initially have tmp_addr and tmp_addr_2 populated
+        for i in range(0, batch_size-VLEN, VLEN):
+            i_const = self.scratch_const(i+VLEN)
+
+            self.instrs.append({"store": [
+                ("vstore", tmp_addr, input_indices + i),
+                ("vstore", tmp_addr_2, input_values + i)
+            ],
+                "alu": [
+                ("+", tmp_addr, self.scratch["inp_indices_p"],
+                 i_const), ("+", tmp_addr_2, self.scratch["inp_values_p"], i_const)]}
+            )
+
+        final_offset = batch_size-VLEN
+        self.instrs.append({"store": [
+            ("vstore", tmp_addr, input_indices + final_offset),
+            ("vstore", tmp_addr_2, input_values + final_offset)
+        ]})
         self.add("flow", ("pause",))
 
 
