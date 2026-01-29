@@ -141,6 +141,23 @@ class KernelBuilder:
             self.const_map[val] = addr
         return self.const_map[val]
 
+    # function to load 2 consts into memory in one cycle
+    # NOTE - a bit duplicated atm, not prio tho
+    def scratch_double_const(self, val1, val2, name1=None, name2=None):
+        ops = []
+        if val1 not in self.const_map:
+            addr = self.alloc_scratch(name1)
+            ops.append(("const", addr, val1))
+            self.const_map[val1] = addr
+        if val2 not in self.const_map:
+            addr = self.alloc_scratch(name2)
+            ops.append(("const", addr, val2))
+            self.const_map[val2] = addr
+        if len(ops) != 0:
+            self.instrs.append({"load": ops})
+        return [self.const_map[val1], self.const_map[val2]]
+        # return self.const_map[val]
+
     def scratch_vconst(self, val, name=None):
         if val not in self.vconst_map:
             addr = self.alloc_scratch(name, VLEN)
@@ -227,6 +244,40 @@ class KernelBuilder:
         #         self.add("load", ("const", tmp1, i))
         #         self.add("load", ("load", vec_batch_is + i, tmp1))
 
+        input_indices = self.alloc_scratch("input_indices", batch_size)
+        input_values = self.alloc_scratch("input_values", batch_size)
+        # keep all these contiguous, just feels right
+        for i in range(0, batch_size, VLEN*2):
+            if i+VLEN < batch_size:
+                self.scratch_double_const(i, i+VLEN)
+            else:
+                self.scratch_const(i)
+        # what im thinking: we initially compute 2 addresses, store in addr1 addr2
+        # then each round we: compute 2 more addresses (store them in same vars), and load 2
+        # then at the end, once, we load the last 2
+        i_const = self.scratch_const(0)
+        self.instrs.append({"alu": [("+", tmp_addr, self.scratch["inp_indices_p"],
+                                     i_const), ("+", tmp_addr_2, self.scratch["inp_values_p"], i_const)]})
+        # now we initially have tmp_addr and tmp_addr_2 populated
+        for i in range(0, batch_size-VLEN, VLEN):
+            i_const = self.scratch_const(i+VLEN)
+
+            self.instrs.append({"load": [
+                ("vload", input_indices + i, tmp_addr),
+                ("vload", input_values + i, tmp_addr_2)
+            ],
+                "alu": [
+                ("+", tmp_addr, self.scratch["inp_indices_p"],
+                 i_const), ("+", tmp_addr_2, self.scratch["inp_values_p"], i_const)]}
+            )
+
+        final_offset = batch_size-VLEN
+        self.instrs.append({"load": [
+            ("vload", input_indices + final_offset, tmp_addr),
+            ("vload", input_values + final_offset, tmp_addr_2)
+        ]})
+        # theoretically at this point we now have all of our input indices and values in 2 256 contiguous blocks of memory
+
         for round in range(rounds):
             for i in range(0, batch_size, VLEN):
                 i_const = self.scratch_const(i)
@@ -245,7 +296,13 @@ class KernelBuilder:
                 # node_val = mem[forest_values_p + idx]
                 self.add("valu", ("+", tmp_vec_3,
                          self.scratch["forest_values_p"], tmp_vec_idx))
-                #
+                # how can i remove this loop? this loop results in 4 cycles per loop = 4 * 16 (rounds) * 256/8 (batch size/vlen) = 2000 cycles
+                # what are we doing here? loading 8 disparate forest values into memory in order to operate on the 8 long vec of them
+                # when we hash
+                # the forest values are readonly, they will always be disparate
+                # additionally the indices cant change
+                # if we need to load 8 things at once we need to vload
+                # but vload loads a block of 8 contiguous values from main memory into scratch
                 for k in range(0, VLEN, 2):
                     self.instrs.append({"load": [
                         ("load", tmp_vec_node_val + k, tmp_vec_3 + k),
@@ -389,7 +446,6 @@ class Tests(unittest.TestCase):
     def test_kernel_cycles(self):
         do_kernel_test(10, 16, 256)
 
-
 # To run all the tests:
 #    python perf_takehome.py
 # To run a specific test:
@@ -402,6 +458,7 @@ class Tests(unittest.TestCase):
 
 # To run the proper checks to see which thresholds you pass:
 #    python tests/submission_tests.py
+
 
 if __name__ == "__main__":
     unittest.main()
