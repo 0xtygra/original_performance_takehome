@@ -49,7 +49,7 @@ class KernelBuilder:
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
-    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
+    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False, skip_debug=True):
         # temporarily reverting while we vectorise everything
         # instrs = []
         # for engine, slot in slots:
@@ -74,6 +74,9 @@ class KernelBuilder:
                 if engine not in instrs[instrs_len - 1]
                 else len(instrs[instrs_len - 1][engine])
             )
+
+            if engine == "debug" and skip_debug:
+                continue
             if prev_engine == engine:
                 if engine == "alu" and curr_engine_len < SLOT_LIMITS[engine]:
                     # simple for now - ensure that the instr we want to pack into the same cycle doesnt depend on the write from the prev alu
@@ -147,32 +150,23 @@ class KernelBuilder:
         return self.vconst_map[val]
 
     def build_hash(self, val_vec_hash_addr, tmp_vec_1, tmp_vec_2, round, i):
-        slots = []
-
         for hi, (op1, val1, op2, op3, val3) in enumerate[
             tuple[str, int, str, str, int]
         ](HASH_STAGES):
-            slots.append(
-                ("valu", (op1, tmp_vec_1, val_vec_hash_addr, self.scratch_vconst(val1)))
-            )
-            slots.append(
-                ("valu", (op3, tmp_vec_2, val_vec_hash_addr, self.scratch_vconst(val3)))
-            )
-            slots.append(
-                ("valu", (op2, val_vec_hash_addr, tmp_vec_1, tmp_vec_2)))
-            slots.append(
-                (
-                    "debug",
-                    (
-                        "vcompare",
-                        val_vec_hash_addr,
-                        [(round, i + j, "hash_stage", hi)
-                         for j in range(VLEN)],
-                    ),
-                )
-            )
-
-        return slots
+            self.instrs.append({
+                "valu": [
+                    (op1, tmp_vec_1, val_vec_hash_addr,
+                     self.scratch_vconst(val1)),
+                    (op3, tmp_vec_2, val_vec_hash_addr,
+                     self.scratch_vconst(val3))
+                ]
+            })
+            self.add("valu", (op2, val_vec_hash_addr, tmp_vec_1, tmp_vec_2))
+            self.add("debug", (
+                "vcompare",
+                val_vec_hash_addr,
+                [(round, i + j, "hash_stage", hi) for j in range(VLEN)],
+            ))
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
@@ -219,8 +213,6 @@ class KernelBuilder:
         # Any debug engine instruction is ignored by the submission simulator
         self.add("debug", ("comment", "Starting loop"))
 
-        body = []  # array of slots
-
         # Scalar scratch registers
         tmp_addr = self.alloc_scratch("tmp_addr")
         tmp_addr_2 = self.alloc_scratch("tmp_addr_2")
@@ -239,145 +231,76 @@ class KernelBuilder:
             for i in range(0, batch_size, VLEN):
                 i_const = self.scratch_const(i)
                 # idx = mem[inp_indices_p + i]
-                # IM COMBINING THESE HERE TO LEVERAGE THE LOGIC WE HAVE IN BUILD THAT
-                # PUTS MULTIPLE ALU INSTRUCTIONS INTO 1 CYCLE IF THEY DONT REFERENCE EACH OTHER
-                # BUT IT WILL ONLY DO IT FOR CONTIGUOUS BLOCKS OF ALU OPERATIONS
-                # WORK ON BUILD TO LOOK AHEAD AND ONLY COMPLETE A CYCLE WHEN IT GETS TO
-                # AN OPERATION THAT RELIES IN THE CURRENT CYCLE
-                # THEN SEE IF WE CAN UNDO THIS CONTIGUOUS CHANGE BELOW AND MOVE THE 2ND ALU BACK TO BEFORE THE LOAD
-                # FOR TMP_ADDR_2
-                body.append(
-                    ("alu", ("+", tmp_addr,
-                     self.scratch["inp_indices_p"], i_const))
-                )
-                body.append(
-                    ("alu", ("+", tmp_addr_2,
-                     self.scratch["inp_values_p"], i_const))
-                )
-                body.append(("load", ("vload", tmp_vec_idx, tmp_addr)))
-                body.append(
-                    (
-                        "debug",
-                        (
-                            "vcompare",
-                            tmp_vec_idx,
-                            [(round, i + j, "idx") for j in range(VLEN)],
-                        ),
-                    )
-                )
-                # val = mem[inp_values_p + i]
-                body.append(("load", ("vload", tmp_vec_val, tmp_addr_2)))
-                body.append(
-                    (
-                        "debug",
-                        (
-                            "vcompare",
-                            tmp_vec_val,
-                            [(round, i + j, "val") for j in range(VLEN)],
-                        ),
-                    )
-                )
+                # self.add("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const))
+                # self.add("alu", ("+", tmp_addr_2, self.scratch["inp_values_p"], i_const))
+                self.instrs.append({"alu": [("+", tmp_addr, self.scratch["inp_indices_p"],
+                                   i_const), ("+", tmp_addr_2, self.scratch["inp_values_p"], i_const)]})
+                self.instrs.append(
+                    {"load": [("vload", tmp_vec_idx, tmp_addr), ("vload", tmp_vec_val, tmp_addr_2)]})
+                self.instrs.append({"debug": [("vcompare", tmp_vec_idx, [
+                    (round, i + j, "idx") for j in range(VLEN)]),
+                    ("vcompare", tmp_vec_val, [
+                        (round, i + j, "val") for j in range(VLEN)])
+                ]})
                 # node_val = mem[forest_values_p + idx]
-                body.append(
-                    ("valu", ("+", tmp_vec_3, self.scratch["forest_values_p"], tmp_vec_idx)))
-                for k in range(VLEN):
-                    body.append(
-                        ("load", ("load", tmp_vec_node_val + k, tmp_vec_3 + k)))
-                # body.append(("load", ("vload", tmp_vec_node_val, tmp_addr_3)))
-                body.append(
-                    (
-                        "debug",
-                        (
-                            "vcompare",
-                            tmp_vec_node_val,
-                            [(round, i + j, "node_val") for j in range(VLEN)],
-                        ),
-                    )
-                )
+                self.add("valu", ("+", tmp_vec_3,
+                         self.scratch["forest_values_p"], tmp_vec_idx))
+                #
+                for k in range(0, VLEN, 2):
+                    self.instrs.append({"load": [
+                        ("load", tmp_vec_node_val + k, tmp_vec_3 + k),
+                        ("load", tmp_vec_node_val + k+1, tmp_vec_3 + k+1)
+                    ]})
+
+                self.add("debug", ("vcompare", tmp_vec_node_val, [
+                         (round, i + j, "node_val") for j in range(VLEN)]))
                 # val = myhash(val ^ node_val)
-                body.append(
-                    ("valu", ("^", tmp_vec_val, tmp_vec_val, tmp_vec_node_val)))
-                body.extend(
-                    self.build_hash(tmp_vec_val, tmp_vec_1,
-                                    tmp_vec_2, round, i)
-                )
-                body.append(
-                    (
-                        "debug",
-                        (
-                            "vcompare",
-                            tmp_vec_val,
-                            [(round, i + j, "hashed_val")
-                             for j in range(VLEN)],
-                        ),
-                    )
-                )
-                # HERE =====================
+                self.add("valu", ("^", tmp_vec_val,
+                         tmp_vec_val, tmp_vec_node_val))
+                self.build_hash(tmp_vec_val, tmp_vec_1, tmp_vec_2, round, i)
+                self.add("debug", ("vcompare", tmp_vec_val, [
+                         (round, i + j, "hashed_val") for j in range(VLEN)]))
                 # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                # CAN REMOVE ONE OF THESE I THINK, THE FIRST MODULE ALREADY GIVES US BINARY
-                body.append(
-                    ("valu", ("%", tmp_vec_1, tmp_vec_val, two_vec_const)))
-                body.append(
-                    ("valu", ("+", tmp_vec_1, tmp_vec_1, one_vec_const)))
-
-                # muladd?
-                body.append(
-                    ("valu", ("multiply_add", tmp_vec_idx, tmp_vec_idx, two_vec_const, tmp_vec_1)))
-                # body.append(
-                #     ("valu", ("+", tmp_vec_idx, tmp_vec_idx, tmp_vec_1)))
-                body.append(
-                    (
-                        "debug",
-                        (
-                            "vcompare",
-                            tmp_vec_idx,
-                            [(round, i + j, "next_idx") for j in range(VLEN)],
-                        ),
-                    )
-                )
+                # self.instrs.append({
+                #     "valu"
+                # })
+                self.add("valu", ("%", tmp_vec_1, tmp_vec_val, two_vec_const))
+                self.add("valu", ("+", tmp_vec_1, tmp_vec_1, one_vec_const))
+                # muladd
+                self.add("valu", ("multiply_add", tmp_vec_idx,
+                         tmp_vec_idx, two_vec_const, tmp_vec_1))
+                self.add("debug", ("vcompare", tmp_vec_idx, [
+                         (round, i + j, "next_idx") for j in range(VLEN)]))
                 # idx = 0 if idx >= n_nodes else idx
-                body.append(
-                    ("valu", ("<", tmp_vec_1, tmp_vec_idx, self.scratch["n_nodes"])))
-                body.append(
-                    (
-                        "flow",
-                        (
-                            "vselect",
-                            tmp_vec_idx,
-                            tmp_vec_1,
-                            tmp_vec_idx,
-                            zero_vec_const,
-                        ),
-                    )
-                )
-                body.append(
-                    (
-                        "debug",
-                        (
-                            "vcompare",
-                            tmp_vec_idx,
-                            [(round, i + j, "wrapped_idx")
-                             for j in range(VLEN)],
-                        ),
-                    )
-                )
+                self.add("valu", ("<", tmp_vec_1, tmp_vec_idx,
+                         self.scratch["n_nodes"]))
+                self.add("flow", ("vselect", tmp_vec_idx,
+                         tmp_vec_1, tmp_vec_idx, zero_vec_const))
+                self.add("debug", ("vcompare", tmp_vec_idx, [
+                         (round, i + j, "wrapped_idx") for j in range(VLEN)]))
                 # mem[inp_indices_p + i] = idx
-                body.append(
-                    ("alu", ("+", tmp_addr,
-                     self.scratch["inp_indices_p"], i_const))
-                )
-                body.append(
-                    ("alu", ("+", tmp_addr_2,
-                     self.scratch["inp_values_p"], i_const))
-                )
-                body.append(("store", ("vstore", tmp_addr, tmp_vec_idx)))
-                # mem[inp_values_p + i] = val
-                body.append(("store", ("vstore", tmp_addr_2, tmp_vec_val)))
+                # self.add(
+                #     "alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const))
+                # self.add("alu", ("+", tmp_addr_2,
+                #          self.scratch["inp_values_p"], i_const))
+                self.instrs.append({
+                    "store": [
+                        ("vstore", tmp_addr, tmp_vec_idx),
+                        ("vstore", tmp_addr_2, tmp_vec_val)
+                    ]
+                })
+                # self.instrs.append({
+                #     "store": [
+                #         ("vstore", tmp_addr, tmp_vec_idx),
+                #         ("vstore", tmp_addr_2, tmp_vec_val)
+                #     ]
+                # })
+                # self.add("store", ("vstore", tmp_addr, tmp_vec_idx))
+                # # mem[inp_values_p + i] = val
+                # self.add("store", ("vstore", tmp_addr_2, tmp_vec_val))
 
-        body_instrs = self.build(body)
-        self.instrs.extend(body_instrs)
         # Required to match with the yield in reference_kernel2
-        self.instrs.append({"flow": [("pause",)]})
+        self.add("flow", ("pause",))
 
 
 BASELINE = 147734
