@@ -268,30 +268,43 @@ class KernelBuilder:
         # then each round we: compute 2 more addresses (store them in same vars), and load 2
         # then at the end, once, we load the last 2
         zero_const = self.scratch_const(0)
+        vlen_const = self.scratch_const(VLEN)
         self.instrs.append({"alu": [
-            ("+", tmp_addr_2, self.scratch["inp_values_p"], zero_const)],
-            "valu": [("vbroadcast", input_indices, zero_const)]})
+            ("+", tmp_addr_2, self.scratch["inp_values_p"], zero_const),
+            ("+", tmp_addr, self.scratch["inp_values_p"], vlen_const),
+        ],
+            "valu": [
+                ("vbroadcast", input_indices, zero_const),
+                ("vbroadcast", input_indices + VLEN, zero_const),
+        ]})
         # now we initially have tmp_addr and tmp_addr_2 populated
-        for i in range(0, batch_size-VLEN, VLEN):
-            i_const = self.scratch_const(i+VLEN)
+        for i in range(0, batch_size-VLEN*2, VLEN*2):
+            i_const = self.scratch_const(i+VLEN*2)
+            i_2nd_const = self.scratch_const(i+VLEN*3)
 
             self.instrs.append({"load": [
-                ("vload", input_values + i, tmp_addr_2)
+                ("vload", input_values + i, tmp_addr_2),
+                ("vload", input_values + i + VLEN, tmp_addr),
             ],
                 "alu": [
-                ("+", tmp_addr_2, self.scratch["inp_values_p"], i_const)],
+                ("+", tmp_addr_2, self.scratch["inp_values_p"], i_const),
+                ("+", tmp_addr, self.scratch["inp_values_p"], i_2nd_const),
+            ],
                 "valu": [
-                    ("vbroadcast", input_indices+i+VLEN, zero_const)
+                    ("vbroadcast", input_indices+i+2*VLEN, zero_const),
+                    ("vbroadcast", input_indices+i+3*VLEN, zero_const),
             ]}
             )
 
-        final_offset = batch_size-VLEN
+        final_offset = batch_size-VLEN*2
         self.instrs.append({"load": [
-            ("vload", input_values + final_offset, tmp_addr_2)
+            ("vload", input_values + final_offset, tmp_addr_2),
+            ("vload", input_values + final_offset + VLEN, tmp_addr),
         ],
-            "valu": [
-            ("vbroadcast", input_indices+final_offset, zero_const)
-        ]})
+            # "valu": [
+            # ("vbroadcast", input_indices+final_offset, zero_const),
+            # ("vbroadcast", input_indices+final_offset + VLEN, zero_const),]
+        })
         # theoretically at this point we now have all of our input indices and values in 2 256 contiguous blocks of memory
 
         for round in range(rounds):
