@@ -267,26 +267,30 @@ class KernelBuilder:
         # what im thinking: we initially compute 2 addresses, store in addr1 addr2
         # then each round we: compute 2 more addresses (store them in same vars), and load 2
         # then at the end, once, we load the last 2
-        i_const = self.scratch_const(0)
-        self.instrs.append({"alu": [("+", tmp_addr, self.scratch["inp_indices_p"],
-                                     i_const), ("+", tmp_addr_2, self.scratch["inp_values_p"], i_const)]})
+        zero_const = self.scratch_const(0)
+        self.instrs.append({"alu": [
+            ("+", tmp_addr_2, self.scratch["inp_values_p"], zero_const)],
+            "valu": [("vbroadcast", input_indices, zero_const)]})
         # now we initially have tmp_addr and tmp_addr_2 populated
         for i in range(0, batch_size-VLEN, VLEN):
             i_const = self.scratch_const(i+VLEN)
 
             self.instrs.append({"load": [
-                ("vload", input_indices + i, tmp_addr),
                 ("vload", input_values + i, tmp_addr_2)
             ],
                 "alu": [
-                ("+", tmp_addr, self.scratch["inp_indices_p"],
-                 i_const), ("+", tmp_addr_2, self.scratch["inp_values_p"], i_const)]}
+                ("+", tmp_addr_2, self.scratch["inp_values_p"], i_const)],
+                "valu": [
+                    ("vbroadcast", input_indices+i+VLEN, zero_const)
+            ]}
             )
 
         final_offset = batch_size-VLEN
         self.instrs.append({"load": [
-            ("vload", input_indices + final_offset, tmp_addr),
             ("vload", input_values + final_offset, tmp_addr_2)
+        ],
+            "valu": [
+            ("vbroadcast", input_indices+final_offset, zero_const)
         ]})
         # theoretically at this point we now have all of our input indices and values in 2 256 contiguous blocks of memory
 
