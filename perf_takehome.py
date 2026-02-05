@@ -166,25 +166,61 @@ class KernelBuilder:
             self.vconst_map[val] = addr
         return self.vconst_map[val]
 
-    def build_hash(self, val_vec_hash_addr, tmp_vec_1, tmp_vec_2, round, i):
+    # TODO: CAN ADD THESE TO OTHER INITIAL ALLOCATIONS TOO
+    def load_hash_values(self):
+        loads = []
+        vbroadcasts = []
         for hash_index, (op1, val1, op2, op3, val3) in enumerate[
             tuple[str, int, str, str, int]
         ](HASH_STAGES):
-            self.instrs.append({
-                "valu": [
-                    (op1, tmp_vec_1, val_vec_hash_addr,
-                     self.scratch_vconst(val1)),
-                    (op3, tmp_vec_2, val_vec_hash_addr,
-                     self.scratch_vconst(val3))
-                ]
-            })
-            self.add("valu", (op2, val_vec_hash_addr, tmp_vec_1, tmp_vec_2))
-            self.add("debug", (
-                "vcompare",
-                val_vec_hash_addr,
-                [(round, i + j, "hash_stage", hash_index)
-                 for j in range(VLEN)],
-            ))
+            addr1 = self.alloc_scratch(None, VLEN)
+            addr3 = self.alloc_scratch(None, VLEN)
+            loads.append(("const", addr1, val1))
+            loads.append(("const", addr3, val3))
+            vbroadcasts.append(("vbroadcast", addr1, addr1))
+            vbroadcasts.append(("vbroadcast", addr3, addr3))
+            self.vconst_map[val1] = addr1
+            self.vconst_map[val3] = addr3
+
+        self.instrs.append({"load": loads[0:2]})
+        for i in range(2, len(loads), 2):
+            self.instrs.append({"load": loads[i:i+2],
+                                "valu": vbroadcasts[i-2:i]})
+        self.instrs.append({"valu": vbroadcasts[-2:]})
+
+    # all 3 vecs must be batch_size long
+    def build_hash(self, input_values_vec, tmp_vec_1, tmp_vec_2, round, i, batch_size):
+        valu_stage_1 = []
+        valu_stage_2 = []
+        for hash_index, (op1, val1, op2, op3, val3) in enumerate[
+            tuple[str, int, str, str, int]
+        ](HASH_STAGES):
+            for j in range(0, batch_size, VLEN):
+                valu_stage_1.append((op1, tmp_vec_1 + j, input_values_vec + j,
+                                     self.scratch_vconst(val1)))
+                valu_stage_1.append((op3, tmp_vec_2 + j, input_values_vec + j,
+                                     self.scratch_vconst(val3)))
+
+                valu_stage_2.append(
+                    (op2, input_values_vec + j, tmp_vec_1 + j, tmp_vec_2 + j))
+
+        i = 0
+        while len(valu_stage_2) + len(valu_stage_1) != 0:
+            if i == 2:
+                self.instrs.append(
+                    {"valu": valu_stage_2[0:SLOT_LIMITS["valu"]]})
+                valu_stage_2 = valu_stage_2[SLOT_LIMITS["valu"]:]
+            else:
+                self.instrs.append(
+                    {"valu": valu_stage_1[0:SLOT_LIMITS["valu"]]})
+                valu_stage_1 = valu_stage_1[SLOT_LIMITS["valu"]:]
+            i = (i+1) % 3
+        for j in range(0, len(valu_stage_1) + len(valu_stage_2), SLOT_LIMITS["valu"]):
+            self.instrs.append(
+                {"valu": valu_stage_1[j:j+SLOT_LIMITS["valu"]]})
+        for j in range(0, len(valu_stage_2), SLOT_LIMITS["valu"]):
+            self.instrs.append(
+                {"valu": valu_stage_2[j:j+SLOT_LIMITS["valu"]]})
 
     def append_to_curr_cycle(self, engine, slot):
         num_cycles = len(self.instrs)
@@ -231,6 +267,7 @@ class KernelBuilder:
         zero_vec_const = self.scratch_vconst(0)
         one_vec_const = self.scratch_vconst(1)
         two_vec_const = self.scratch_vconst(2)
+        self.load_hash_values()
 
         # Pause instructions are matched up with yield statements in the reference
         # kernel to let you debug at intermediate steps. The testing harness in this
@@ -243,8 +280,6 @@ class KernelBuilder:
         # Scalar scratch registers
         tmp_addr = self.alloc_scratch("tmp_addr")
         tmp_addr_2 = self.alloc_scratch("tmp_addr_2")
-        tmp_vec_1 = self.alloc_scratch("tmp_vec_1", VLEN)
-        tmp_vec_2 = self.alloc_scratch("tmp_vec_2", VLEN)
         # stores the 8 disparate forest values for our current batch
         forest_values_p_vec = self.alloc_scratch(
             "forest_values_vec", batch_size)
@@ -256,8 +291,9 @@ class KernelBuilder:
 
         input_indices = self.alloc_scratch("input_indices", batch_size)
         input_values = self.alloc_scratch("input_values", batch_size)
-        tmp_vec_batch_size = self.alloc_scratch(
-            "tmp_vec_batch_size", batch_size)
+        forest_level_0_val = self.alloc_scratch("forest_level_0_val")
+        self.instrs.append(
+            {"load": [("load", forest_level_0_val, self.scratch["forest_values_p"])]})
         # keep all these contiguous, just feels right
         for i in range(0, batch_size, VLEN*2):
             if i+VLEN < batch_size:
@@ -319,48 +355,63 @@ class KernelBuilder:
                 # node_val = mem[forest_values_p + idx]
                 self.append_to_curr_cycle("valu", ("+", forest_values_p_vec + i,
                                                    self.scratch["forest_values_p"], input_indices+i))
-            for i in range(0, batch_size, VLEN):
-                i_const = self.scratch_const(i)
-                # how can i remove this loop? this loop results in 4 cycles per loop = 4 * 16 (rounds) * 256/8 (batch size/vlen) = 2000 cycles
-                # what are we doing here? loading 8 disparate forest values into memory in order to operate on the 8 long vec of them
-                # when we hash
-                # the forest values are readonly, they will always be disparate
-                # additionally the indices cant change
-                # if we need to load 8 things at once we need to vload
-                # but vload loads a block of 8 contiguous values from main memory into scratch
-                for k in range(0, VLEN, 2):
-                    self.instrs.append({"load": [
-                        ("load", forest_values_vec + i +
-                         k, forest_values_p_vec + i + k),
-                        ("load", forest_values_vec + i +
-                         k+1, forest_values_p_vec + i + k+1)
-                    ]})
+            # saves us 500 cycles
+            if round % (forest_height+1) == 0:
+                for i in range(0, batch_size, VLEN*2):
+                    self.instrs.append(
+                        {"valu": [
+                            ("vbroadcast", forest_values_vec + i, forest_level_0_val),
+                            ("vbroadcast", forest_values_vec +
+                             i + VLEN, forest_level_0_val)
+                        ]})
+            else:
+                for i in range(0, batch_size, VLEN):
+                    i_const = self.scratch_const(i)
+                    # how can i remove this loop? this loop results in 4 cycles per loop = 4 * 16 (rounds) * 256/8 (batch size/vlen) = 2000 cycles
+                    # what are we doing here? loading 8 disparate forest values into memory in order to operate on the 8 long vec of them
+                    # when we hash
+                    # the forest values are readonly, they will always be disparate
+                    # additionally the indices cant change
+                    # if we need to load 8 things at once we need to vload
+                    # but vload loads a block of 8 contiguous values from main memory into scratch
+                    for k in range(0, VLEN, 2):
+                        self.instrs.append({"load": [
+                            ("load", forest_values_vec + i +
+                             k, forest_values_p_vec + i + k),
+                            ("load", forest_values_vec + i +
+                             k+1, forest_values_p_vec + i + k+1)
+                        ]})
 
-                self.add("debug", ("vcompare", forest_values_vec+i, [
-                         (round, i + j, "node_val") for j in range(VLEN)]))
+                    self.add("debug", ("vcompare", forest_values_vec+i, [
+                        (round, i + j, "node_val") for j in range(VLEN)]))
 
             for i in range(0, batch_size, VLEN):
                 i_const = self.scratch_const(i)
                 self.append_to_curr_cycle("valu", ("^", input_values + i,
                                                    input_values + i, forest_values_vec+i))
 
+            print(len(self.instrs))
+            # this is 150 cycles each round
+            # 256 elements in the vector, 3 parts of each hash stage, 6 hash stages
+            # valu 6 slot limit + doing 8 at a time
+            # -> 256 * 3 * 6 / (6*8) = 96
+            self.build_hash(input_values, forest_values_p_vec,
+                            forest_values_vec, round, i, batch_size)
             for i in range(0, batch_size, VLEN):
-                i_const = self.scratch_const(i)
-                self.build_hash(input_values + i, tmp_vec_1,
-                                tmp_vec_2, round, i)
                 self.add("debug", ("vcompare", input_values + i, [
                          (round, i + j, "hashed_val") for j in range(VLEN)]))
 
+            print(len(self.instrs))
             for i in range(0, batch_size, VLEN):
                 i_const = self.scratch_const(i)
                 # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                self.append_to_curr_cycle("valu", ("%", tmp_vec_batch_size + i,
+                self.append_to_curr_cycle("valu", ("%", forest_values_p_vec + i,
                                                    input_values + i, two_vec_const))
 
             for i in range(0, batch_size, VLEN):
                 i_const = self.scratch_const(i)
                 self.append_to_curr_cycle(
-                    "valu", ("+", tmp_vec_batch_size + i, tmp_vec_batch_size + i, one_vec_const))
+                    "valu", ("+", forest_values_p_vec + i, forest_values_p_vec + i, one_vec_const))
 
             # this does almost nothing lmao saves us like 50 cycles
             if round == forest_height:
@@ -372,7 +423,7 @@ class KernelBuilder:
                     i_const = self.scratch_const(i)
                     # idx = 2*idx + (1 if val % 2 == 0 else 2)
                     self.append_to_curr_cycle("valu", ("multiply_add", input_indices+i,
-                                                       input_indices+i, two_vec_const, tmp_vec_batch_size + i))
+                                                       input_indices+i, two_vec_const, forest_values_p_vec + i))
                     self.append_to_curr_cycle("debug", ("vcompare", input_indices+i, [
                         (round, i + j, "next_idx") for j in range(VLEN)]))
                     # idx = 0 if idx >= n_nodes else idx
