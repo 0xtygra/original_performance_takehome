@@ -195,18 +195,28 @@ class KernelBuilder:
         for hash_index, (op1, val1, op2, op3, val3) in enumerate[
             tuple[str, int, str, str, int]
         ](HASH_STAGES):
+            # 0 2 4 are all mul add
+            # 1 3 5 unchanges
+            # before we had 2 stage 1s for every stage 2, now we have 1 2 1 2 1 2 stage 1s for 6 stage 2s = 9 for 6
+            # these stages: add input and val1, left shift (multiply) input by val3, then add the results of both
+            # instead we can multiply input and add the result of the first add in the same op
             for j in range(0, batch_size, VLEN):
-                valu_stage_1.append((op1, tmp_vec_1 + j, input_values_vec + j,
-                                     self.scratch_vconst(val1)))
-                valu_stage_1.append((op3, tmp_vec_2 + j, input_values_vec + j,
-                                     self.scratch_vconst(val3)))
-
-                valu_stage_2.append(
-                    (op2, input_values_vec + j, tmp_vec_1 + j, tmp_vec_2 + j))
+                if hash_index % 2 == 0:
+                    valu_stage_1.append((op1, tmp_vec_1 + j, input_values_vec + j,
+                                        self.scratch_vconst(val1)))
+                    valu_stage_2.append(("multiply_add", input_values_vec + j, input_values_vec + j, self.scratch_vconst(val3),
+                                        tmp_vec_1 + j))
+                else:
+                    valu_stage_1.append((op1, tmp_vec_1 + j, input_values_vec + j,
+                                        self.scratch_vconst(val1)))
+                    valu_stage_1.append((op3, tmp_vec_2 + j, input_values_vec + j,
+                                        self.scratch_vconst(val3)))
+                    valu_stage_2.append(
+                        (op2, input_values_vec + j, tmp_vec_1 + j, tmp_vec_2 + j))
 
         i = 0
         while len(valu_stage_2) + len(valu_stage_1) != 0:
-            if i == 2:
+            if i > 2:
                 self.instrs.append(
                     {"valu": valu_stage_2[0:SLOT_LIMITS["valu"]]})
                 valu_stage_2 = valu_stage_2[SLOT_LIMITS["valu"]:]
@@ -214,13 +224,14 @@ class KernelBuilder:
                 self.instrs.append(
                     {"valu": valu_stage_1[0:SLOT_LIMITS["valu"]]})
                 valu_stage_1 = valu_stage_1[SLOT_LIMITS["valu"]:]
-            i = (i+1) % 3
-        for j in range(0, len(valu_stage_1) + len(valu_stage_2), SLOT_LIMITS["valu"]):
-            self.instrs.append(
-                {"valu": valu_stage_1[j:j+SLOT_LIMITS["valu"]]})
-        for j in range(0, len(valu_stage_2), SLOT_LIMITS["valu"]):
-            self.instrs.append(
-                {"valu": valu_stage_2[j:j+SLOT_LIMITS["valu"]]})
+            i = (i+1) % 5
+
+        # for j in range(0, len(valu_stage_1) + len(valu_stage_2), SLOT_LIMITS["valu"]):
+        #     self.instrs.append(
+        #         {"valu": valu_stage_1[j:j+SLOT_LIMITS["valu"]]})
+        # for j in range(0, len(valu_stage_2), SLOT_LIMITS["valu"]):
+        #     self.instrs.append(
+        #         {"valu": valu_stage_2[j:j+SLOT_LIMITS["valu"]]})
 
     def append_to_curr_cycle(self, engine, slot):
         num_cycles = len(self.instrs)

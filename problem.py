@@ -140,7 +140,7 @@ class Machine:
     def scratch_map(self, core):
         res = {}
         for addr, (name, length) in self.debug_info.scratch_map.items():
-            res[name] = core.scratch[addr : addr + length]
+            res[name] = core.scratch[addr: addr + length]
         return res
 
     def rewrite_slot(self, slot):
@@ -259,7 +259,8 @@ class Machine:
             case ("multiply_add", dest, a, b, c):
                 for i in range(VLEN):
                     mul = (core.scratch[a + i] * core.scratch[b + i]) % (2**32)
-                    self.scratch_write[dest + i] = (mul + core.scratch[c + i]) % (2**32)
+                    self.scratch_write[dest +
+                                       i] = (mul + core.scratch[c + i]) % (2**32)
             case (op, dest, a1, a2):
                 for i in range(VLEN):
                     self.alu(core, op, dest + i, a1 + i, a2 + i)
@@ -338,7 +339,7 @@ class Machine:
         # You can add extra stuff to the trace if you want!
         for addr, (name, length) in self.debug_info.scratch_map.items():
             if any((addr + vi) in self.scratch_write for vi in range(length)):
-                val = str(core.scratch[addr : addr + length])
+                val = str(core.scratch[addr: addr + length])
                 val = val.replace("[", "").replace("]", "")
                 self.trace.write(
                     f'{{"name": "{val}", "cat": "op", "ph": "X", "pid": {len(self.cores) + core.id}, "tid": {BASE_ADDR_TID + addr}, "ts": {self.cycle}, "dur": 1 }},\n'
@@ -375,7 +376,7 @@ class Machine:
                     elif slot[0] == "vcompare":
                         loc, keys = slot[1], slot[2]
                         ref = [self.value_trace[key] for key in keys]
-                        res = core.scratch[loc : loc + VLEN]
+                        res = core.scratch[loc: loc + VLEN]
                         assert res == ref, (
                             f"{res} != {ref} for {keys} at pc={core.pc} loc={loc}"
                         )
@@ -437,13 +438,21 @@ class Input:
 
 
 HASH_STAGES = [
-    ("+", 0x7ED55D16, "+", "<<", 12),
+    ("+", 0x7ED55D16, "+", "*", 2**12),
     ("^", 0xC761C23C, "^", ">>", 19),
-    ("+", 0x165667B1, "+", "<<", 5),
+    ("+", 0x165667B1, "+", "*", 2**5),
     ("+", 0xD3A2646C, "^", "<<", 9),
-    ("+", 0xFD7046C5, "+", "<<", 3),
+    ("+", 0xFD7046C5, "+", "*", 2**3),
     ("^", 0xB55A4F09, "^", ">>", 16),
 ]
+# HASH_STAGES = [
+#     ("+", 0x7ED55D16, "+", "<<", 12),
+#     ("^", 0xC761C23C, "^", ">>", 19),
+#     ("+", 0x165667B1, "+", "<<", 5),
+#     ("+", 0xD3A2646C, "^", "<<", 9),
+#     ("+", 0xFD7046C5, "+", "<<", 3),
+#     ("^", 0xB55A4F09, "^", ">>", 16),
+# ]
 
 
 def myhash(a: int) -> int:
@@ -453,6 +462,7 @@ def myhash(a: int) -> int:
         "^": lambda x, y: x ^ y,
         "<<": lambda x, y: x << y,
         ">>": lambda x, y: x >> y,
+        "*": lambda x, y: x*y
     }
 
     def r(x):
@@ -491,7 +501,8 @@ def build_mem_image(t: Tree, inp: Input) -> list[int]:
     header = 7
     extra_room = len(t.values) + len(inp.indices) * 2 + VLEN * 2 + 32
     mem = [0] * (
-        header + len(t.values) + len(inp.indices) + len(inp.values) + extra_room
+        header + len(t.values) + len(inp.indices) +
+        len(inp.values) + extra_room
     )
     forest_values_p = header
     inp_indices_p = forest_values_p + len(t.values)
@@ -520,6 +531,7 @@ def myhash_traced(a: int, trace: dict[Any, int], round: int, batch_i: int) -> in
         "^": lambda x, y: x ^ y,
         "<<": lambda x, y: x << y,
         ">>": lambda x, y: x >> y,
+        "*": lambda x, y: x * y
     }
 
     def r(x):
