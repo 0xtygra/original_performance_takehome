@@ -318,6 +318,12 @@ class KernelBuilder:
         # then at the end, once, we load the last 2
         zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
+
+        three_const = self.scratch_const(3)
+        four_const = self.scratch_const(4)
+        five_const = self.scratch_const(5)
+        six_const = self.scratch_const(6)
+
         vlen_const = self.scratch_const(VLEN)
         self.instrs.append({"alu": [
             ("+", tmp_addr_2, self.scratch["inp_values_p"], zero_const),
@@ -429,6 +435,114 @@ class KernelBuilder:
                 self.instrs.append({
                     "flow": [("vselect", input_values+batch_size-VLEN, index_mask, index_forest_xor_1, index_forest_xor_2)]
                 })
+
+            elif round % (forest_height+1) == 2:
+                # our input_indices are [1,1,2,1,2,2,1,2,...]
+                forest_val_1 = forest_values_vec
+                forest_val_2 = forest_values_vec + 1
+                forest_val_3 = forest_values_vec + 2
+                forest_val_4 = forest_values_vec + 3
+
+                addr1 = forest_values_vec + 4
+                addr2 = forest_values_vec + 5
+                addr3 = forest_values_vec + 6
+                addr4 = forest_values_vec + 7
+
+                forest_val_1_vec = forest_values_vec+VLEN
+                forest_val_2_vec = forest_values_vec+2*VLEN
+                forest_val_3_vec = forest_values_vec+3*VLEN
+                forest_val_4_vec = forest_values_vec+4*VLEN
+
+                three_vconst = forest_values_vec + 5*VLEN
+                four_vconst = forest_values_vec + 6*VLEN
+                five_vconst = forest_values_vec + 7*VLEN
+                six_vconst = forest_values_vec + 8*VLEN
+
+                offset = 128
+                index_mask1 = forest_values_vec+offset
+                index_mask2 = forest_values_vec+offset+VLEN
+                index_mask3 = forest_values_vec+offset+VLEN*2
+                index_mask4 = forest_values_vec+offset+VLEN*3
+                index_forest_xor_1 = forest_values_vec + offset + VLEN*4
+                index_forest_xor_2 = forest_values_vec + offset + VLEN*5
+                index_forest_xor_3 = forest_values_vec + offset + VLEN*6
+                index_forest_xor_4 = forest_values_vec + offset + VLEN*7
+
+                self.instrs.append(
+                    {"alu": [("+", addr1, self.scratch["forest_values_p"], three_const),
+                             ("+", addr2,
+                              self.scratch["forest_values_p"], four_const),
+                             ("+", addr3,
+                              self.scratch["forest_values_p"], five_const),
+                             ("+", addr4,
+                              self.scratch["forest_values_p"], six_const)
+                             ]})
+                self.instrs.append(
+                    {"load": [("load", forest_val_1, addr1),
+                              ("load", forest_val_2, addr2)],
+                     "valu": [
+                         ("vbroadcast", three_vconst, three_const),
+                         ("vbroadcast", four_vconst, four_const),
+                         ("vbroadcast", five_vconst, five_const),
+                         ("vbroadcast", six_vconst, six_const),
+                    ]
+                    })
+                self.instrs.append({
+                    "load": [("load", forest_val_3, addr3),
+                             ("load", forest_val_4, addr4)],
+                    "valu": [
+                        ("vbroadcast", forest_val_1_vec, forest_val_1),
+                        ("vbroadcast", forest_val_2_vec, forest_val_2),
+                    ]
+                })
+                self.instrs.append({
+                    "valu": [("vbroadcast", forest_val_3_vec, forest_val_3),
+                             ("vbroadcast", forest_val_4_vec, forest_val_4),]
+                })
+
+                for i in range(0, batch_size, VLEN):
+                    self.instrs.append({
+                        "valu": [
+                            ("==", index_mask1, input_indices+i, three_vconst),
+                            ("==", index_mask2, input_indices+i, four_vconst),
+                            ("==", index_mask3, input_indices+i, five_vconst),
+                            ("==", index_mask4, input_indices+i, six_vconst),
+                        ]
+                    })
+
+                    self.instrs.append({
+                        "valu": [
+                            ("*", index_forest_xor_1,
+                             forest_val_1_vec, index_mask1),
+                            ("*", index_forest_xor_2,
+                             forest_val_2_vec, index_mask2),
+                            ("*", index_forest_xor_3,
+                             forest_val_3_vec, index_mask3),
+                            ("*", index_forest_xor_4,
+                             forest_val_4_vec, index_mask4),
+                        ]
+                    })
+
+                    self.instrs.append({
+                        "valu": [
+                            ("^", input_values+i, input_values+i, index_forest_xor_1)
+                        ]
+                    })
+                    self.instrs.append({
+                        "valu": [
+                            ("^", input_values+i, input_values+i, index_forest_xor_2)
+                        ]
+                    })
+                    self.instrs.append({
+                        "valu": [
+                            ("^", input_values+i, input_values+i, index_forest_xor_3)
+                        ]
+                    })
+                    self.instrs.append({
+                        "valu": [
+                            ("^", input_values+i, input_values+i, index_forest_xor_4)
+                        ]
+                    })
 
             else:
                 for i in range(0, batch_size, VLEN):
