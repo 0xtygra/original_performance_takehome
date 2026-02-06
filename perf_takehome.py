@@ -189,6 +189,7 @@ class KernelBuilder:
         self.instrs.append({"valu": vbroadcasts[-2:]})
 
     # all 3 vecs must be batch_size long
+    # this only takes 80 cycles per call
     def build_hash(self, input_values_vec, tmp_vec_1, tmp_vec_2, round, i, batch_size):
         valu_stage_1 = []
         valu_stage_2 = []
@@ -303,6 +304,7 @@ class KernelBuilder:
         input_indices = self.alloc_scratch("input_indices", batch_size)
         input_values = self.alloc_scratch("input_values", batch_size)
         forest_level_0_val = self.alloc_scratch("forest_level_0_val")
+
         self.instrs.append(
             {"load": [("load", forest_level_0_val, self.scratch["forest_values_p"])]})
         # keep all these contiguous, just feels right
@@ -315,6 +317,7 @@ class KernelBuilder:
         # then each round we: compute 2 more addresses (store them in same vars), and load 2
         # then at the end, once, we load the last 2
         zero_const = self.scratch_const(0)
+        one_const = self.scratch_const(1)
         vlen_const = self.scratch_const(VLEN)
         self.instrs.append({"alu": [
             ("+", tmp_addr_2, self.scratch["inp_values_p"], zero_const),
@@ -363,7 +366,6 @@ class KernelBuilder:
                     ("vcompare", input_values + i, [
                         (round, i + j, "val") for j in range(VLEN)])
                 ]})
-                # node_val = mem[forest_values_p + idx]
                 self.append_to_curr_cycle("valu", ("+", forest_values_p_vec + i,
                                                    self.scratch["forest_values_p"], input_indices+i))
             # saves us 500 cycles
@@ -375,6 +377,59 @@ class KernelBuilder:
                             ("vbroadcast", forest_values_vec +
                              i + VLEN, forest_level_0_val)
                         ]})
+                for i in range(0, batch_size, VLEN):
+                    i_const = self.scratch_const(i)
+                    self.append_to_curr_cycle("valu", ("^", input_values + i,
+                                                       input_values + i, forest_values_vec+i))
+            elif round % (forest_height + 1) == 1:
+                # our input_indices are [1,1,2,1,2,2,1,2,...]
+                forest_val_1 = forest_values_vec
+                forest_val_2 = forest_values_vec + 1
+                forest_val_1_vec = forest_values_vec+VLEN
+                forest_val_2_vec = forest_values_vec+2*VLEN
+                offset = 128
+                index_mask = forest_values_vec+offset
+                index_forest_xor_1 = forest_values_vec + offset + VLEN
+                index_forest_xor_2 = forest_values_vec + offset + 2*VLEN
+                self.instrs.append(
+                    {"alu": [("+", tmp_addr, self.scratch["forest_values_p"], one_const)],
+                     "flow": [("add_imm", tmp_addr_2, self.scratch["forest_values_p"], 2)]})
+                self.instrs.append(
+                    {"load": [("load", forest_val_1, tmp_addr),
+                              ("load", forest_val_2, tmp_addr_2)]})
+                self.instrs.append({
+                    "valu": [
+                        ("vbroadcast", forest_val_1_vec, forest_val_1),
+                        ("vbroadcast", forest_val_2_vec, forest_val_2),
+                    ]
+                })
+                # at this point our forest_values_vec has the 1st level of our forest loaded in at indexes 1 and 2
+                # if our input_indices has a lsb of 0, we need forest_values_vec[0], otherwise 1
+                # let's use forest_values_vec + 128 for this
+                # creating our mask as well as a and b options
+                self.instrs.append({
+                    "valu": [("&", index_mask, one_vec_const, input_indices),
+                             ("^", index_forest_xor_1,
+                              input_values, forest_val_1_vec),
+                             ("^", index_forest_xor_2,
+                              input_values, forest_val_2_vec),
+                             ]
+                })
+                # forest_values_vec now has a mask
+                for i in range(VLEN, batch_size, VLEN):
+                    self.instrs.append({
+                        "valu": [("&", index_mask, one_vec_const, input_indices + i),
+                                 ("^", index_forest_xor_1,
+                                  input_values+i, forest_val_1_vec),
+                                 ("^", index_forest_xor_2,
+                                  input_values+i, forest_val_2_vec),
+                                 ],
+                        "flow": [("vselect", input_values+i - VLEN, index_mask, index_forest_xor_1, index_forest_xor_2)]
+                    })
+                self.instrs.append({
+                    "flow": [("vselect", input_values+batch_size-VLEN, index_mask, index_forest_xor_1, index_forest_xor_2)]
+                })
+
             else:
                 for i in range(0, batch_size, VLEN):
                     i_const = self.scratch_const(i)
@@ -396,10 +451,10 @@ class KernelBuilder:
                     self.add("debug", ("vcompare", forest_values_vec+i, [
                         (round, i + j, "node_val") for j in range(VLEN)]))
 
-            for i in range(0, batch_size, VLEN):
-                i_const = self.scratch_const(i)
-                self.append_to_curr_cycle("valu", ("^", input_values + i,
-                                                   input_values + i, forest_values_vec+i))
+                for i in range(0, batch_size, VLEN):
+                    i_const = self.scratch_const(i)
+                    self.append_to_curr_cycle("valu", ("^", input_values + i,
+                                                       input_values + i, forest_values_vec+i))
 
             print(len(self.instrs))
             # this is 150 cycles each round
