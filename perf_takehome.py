@@ -318,6 +318,7 @@ class KernelBuilder:
         # then at the end, once, we load the last 2
         zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
+        two_const = self.scratch_const(2)
 
         three_const = self.scratch_const(3)
         four_const = self.scratch_const(4)
@@ -388,18 +389,77 @@ class KernelBuilder:
                     self.append_to_curr_cycle("valu", ("^", input_values + i,
                                                        input_values + i, forest_values_vec+i))
             elif round % (forest_height + 1) == 1:
+                # prev approach - maybe more efficient? tbd on cycle packing
+                #
                 # our input_indices are [1,1,2,1,2,2,1,2,...]
+                # forest_val_1 = forest_values_vec
+                # forest_val_2 = forest_values_vec + 1
+                # forest_val_1_vec = forest_values_vec+VLEN
+                # forest_val_2_vec = forest_values_vec+2*VLEN
+                # offset = 128
+                # index_mask = forest_values_vec+offset
+                # index_forest_xor_1 = forest_values_vec + offset + VLEN
+                # index_forest_xor_2 = forest_values_vec + offset + 2*VLEN
+                # self.instrs.append(
+                #     {"alu": [("+", tmp_addr, self.scratch["forest_values_p"], one_const)],
+                #      "flow": [("add_imm", tmp_addr_2, self.scratch["forest_values_p"], 2)]})
+                # self.instrs.append(
+                #     {"load": [("load", forest_val_1, tmp_addr),
+                #               ("load", forest_val_2, tmp_addr_2)]})
+                # self.instrs.append({
+                #     "valu": [
+                #         ("vbroadcast", forest_val_1_vec, forest_val_1),
+                #         ("vbroadcast", forest_val_2_vec, forest_val_2),
+                #     ]
+                # })
+                # # at this point our forest_values_vec has the 1st level of our forest loaded in at indexes 1 and 2
+                # # if our input_indices has a lsb of 0, we need forest_values_vec[0], otherwise 1
+                # # let's use forest_values_vec + 128 for this
+                # # creating our mask as well as a and b options
+                # self.instrs.append({
+                #     "valu": [("&", index_mask, one_vec_const, input_indices),
+                #              ("^", index_forest_xor_1,
+                #               input_values, forest_val_1_vec),
+                #              ("^", index_forest_xor_2,
+                #               input_values, forest_val_2_vec),
+                #              ]
+                # })
+                # # forest_values_vec now has a mask
+                # for i in range(VLEN, batch_size, VLEN):
+                #     self.instrs.append({
+                #         "valu": [("&", index_mask, one_vec_const, input_indices + i),
+                #                  ("^", index_forest_xor_1,
+                #                   input_values+i, forest_val_1_vec),
+                #                  ("^", index_forest_xor_2,
+                #                   input_values+i, forest_val_2_vec),
+                #                  ],
+                #         "flow": [("vselect", input_values+i - VLEN, index_mask, index_forest_xor_1, index_forest_xor_2)]
+                #     })
+                # self.instrs.append({
+                #     "flow": [("vselect", input_values+batch_size-VLEN, index_mask, index_forest_xor_1, index_forest_xor_2)]
+                # })
+
                 forest_val_1 = forest_values_vec
                 forest_val_2 = forest_values_vec + 1
                 forest_val_1_vec = forest_values_vec+VLEN
                 forest_val_2_vec = forest_values_vec+2*VLEN
                 offset = 128
                 index_mask = forest_values_vec+offset
-                index_forest_xor_1 = forest_values_vec + offset + VLEN
-                index_forest_xor_2 = forest_values_vec + offset + 2*VLEN
+                index_mask2 = forest_values_vec+offset + VLEN
+                index_mask3 = forest_values_vec+offset + VLEN*4
+                index_mask4 = forest_values_vec+offset + VLEN*5
+                index_mask5 = forest_values_vec+offset + VLEN*6
+                index_mask6 = forest_values_vec+offset + VLEN*7
+                index_forest_xor_1 = forest_values_vec + offset + 2*VLEN
+                index_forest_xor_2 = forest_values_vec + offset + 3*VLEN
+                index_forest_xor_3 = forest_values_vec + offset + 8*VLEN
+                index_forest_xor_4 = forest_values_vec + offset + 9*VLEN
+                index_forest_xor_5 = forest_values_vec + offset + 10*VLEN
+                index_forest_xor_6 = forest_values_vec + offset + 12*VLEN
                 self.instrs.append(
-                    {"alu": [("+", tmp_addr, self.scratch["forest_values_p"], one_const)],
-                     "flow": [("add_imm", tmp_addr_2, self.scratch["forest_values_p"], 2)]})
+                    {"alu": [("+", tmp_addr, self.scratch["forest_values_p"], one_const),
+                             ("+", tmp_addr_2, self.scratch["forest_values_p"], two_const)],
+                     })
                 self.instrs.append(
                     {"load": [("load", forest_val_1, tmp_addr),
                               ("load", forest_val_2, tmp_addr_2)]})
@@ -409,32 +469,73 @@ class KernelBuilder:
                         ("vbroadcast", forest_val_2_vec, forest_val_2),
                     ]
                 })
-                # at this point our forest_values_vec has the 1st level of our forest loaded in at indexes 1 and 2
-                # if our input_indices has a lsb of 0, we need forest_values_vec[0], otherwise 1
-                # let's use forest_values_vec + 128 for this
-                # creating our mask as well as a and b options
-                self.instrs.append({
-                    "valu": [("&", index_mask, one_vec_const, input_indices),
-                             ("^", index_forest_xor_1,
-                              input_values, forest_val_1_vec),
-                             ("^", index_forest_xor_2,
-                              input_values, forest_val_2_vec),
-                             ]
-                })
-                # forest_values_vec now has a mask
-                for i in range(VLEN, batch_size, VLEN):
+                for i in range(0, batch_size, VLEN*3):
                     self.instrs.append({
-                        "valu": [("&", index_mask, one_vec_const, input_indices + i),
-                                 ("^", index_forest_xor_1,
-                                  input_values+i, forest_val_1_vec),
-                                 ("^", index_forest_xor_2,
-                                  input_values+i, forest_val_2_vec),
-                                 ],
-                        "flow": [("vselect", input_values+i - VLEN, index_mask, index_forest_xor_1, index_forest_xor_2)]
+                        "valu": [("==", index_mask, one_vec_const, input_indices + i),
+                                 # lsb 0 -> index 2
+                                 ("==", index_mask2, two_vec_const,
+                                  input_indices + i),
+                                 ("==", index_mask3, one_vec_const,
+                                  input_indices + i + VLEN),
+                                 ("==", index_mask4, two_vec_const,
+                                  input_indices + i + VLEN),
+                                 ("==", index_mask5, one_vec_const,
+                                  input_indices + i + 2*VLEN),
+                                 ("==", index_mask6, two_vec_const,
+                                  input_indices + i + 2*VLEN),
+                                 ][0:2*(batch_size-i)//8]
                     })
-                self.instrs.append({
-                    "flow": [("vselect", input_values+batch_size-VLEN, index_mask, index_forest_xor_1, index_forest_xor_2)]
-                })
+                    self.instrs.append({
+                        "valu": [
+                            ("*", index_forest_xor_1, index_mask, forest_val_1_vec),
+                            ("*", index_forest_xor_2,
+                             index_mask2, forest_val_2_vec),
+                            ("*", index_forest_xor_3,
+                             index_mask3, forest_val_1_vec),
+                            ("*", index_forest_xor_4,
+                             index_mask4, forest_val_2_vec),
+                            ("*", index_forest_xor_5,
+                             index_mask5, forest_val_1_vec),
+                            ("*", index_forest_xor_6,
+                             index_mask6, forest_val_2_vec),
+                        ][0:2*(batch_size-i)//8]
+                    })
+                    self.instrs.append({"valu": [
+                        ("^", input_values+i, input_values+i, index_forest_xor_1),
+                        # ("*", index_forest_xor_1, index_mask, forest_val_1_vec),
+                        ("^", input_values+VLEN+i, input_values +
+                         VLEN+i, index_forest_xor_3),
+                        # ("*", index_forest_xor_3, index_mask3, forest_val_1_vec),
+                        ("^", input_values+VLEN*2+i, input_values +
+                         VLEN*2+i, index_forest_xor_5),
+                        # ("*", index_forest_xor_5, index_mask5, forest_val_1_vec),
+
+                    ][0:(batch_size-i)//8]})
+                    self.instrs.append({"valu": [
+                        ("^", input_values+i, input_values+i, index_forest_xor_2),
+                        # ("*", index_forest_xor_2, index_mask, forest_val_2_vec),
+                        ("^", input_values+VLEN+i, input_values +
+                         VLEN+i, index_forest_xor_4),
+                        # ("*", index_forest_xor_4, index_mask3, forest_val_2_vec),
+                        ("^", input_values+VLEN*2+i, input_values +
+                         VLEN*2+i, index_forest_xor_6),
+                        # ("*", index_forest_xor_6, index_mask5, forest_val_2_vec),
+                    ][0:(batch_size-i)//8]})
+                # our batch_size is 256 and the above does 3 8 long vecs at a time
+                # this leaves us with 2 vecs in the end as the above loop
+                #     self.instrs.append({
+                #         "valu": [("&", index_mask, one_vec_const, input_indices + i),
+                #                  ("&", index_mask2, zero_vec_const, input_indices + i)
+                #                  ("^", index_forest_xor_1,
+                #                   input_values+i, forest_val_1_vec),
+                #                  ("^", index_forest_xor_2,
+                #                   input_values+i, forest_val_2_vec),
+                #                  ],
+                #         "flow": [("vselect", input_values+i - VLEN, index_mask, index_forest_xor_1, index_forest_xor_2)]
+                #     })
+                # self.instrs.append({
+                #     "flow": [("vselect", input_values+batch_size-VLEN, index_mask, index_forest_xor_1, index_forest_xor_2)]
+                # })
 
             elif round % (forest_height+1) == 2:
                 # our input_indices are [1,1,2,1,2,2,1,2,...]
@@ -459,7 +560,7 @@ class KernelBuilder:
                 six_vconst = forest_values_vec + 8*VLEN
 
                 offset = 128
-                index_mask1 = forest_values_vec+offset
+                index_mask = forest_values_vec+offset
                 index_mask2 = forest_values_vec+offset+VLEN
                 index_mask3 = forest_values_vec+offset+VLEN*2
                 index_mask4 = forest_values_vec+offset+VLEN*3
@@ -503,7 +604,7 @@ class KernelBuilder:
                 for i in range(0, batch_size, VLEN):
                     self.instrs.append({
                         "valu": [
-                            ("==", index_mask1, input_indices+i, three_vconst),
+                            ("==", index_mask, input_indices+i, three_vconst),
                             ("==", index_mask2, input_indices+i, four_vconst),
                             ("==", index_mask3, input_indices+i, five_vconst),
                             ("==", index_mask4, input_indices+i, six_vconst),
@@ -513,7 +614,7 @@ class KernelBuilder:
                     self.instrs.append({
                         "valu": [
                             ("*", index_forest_xor_1,
-                             forest_val_1_vec, index_mask1),
+                             forest_val_1_vec, index_mask),
                             ("*", index_forest_xor_2,
                              forest_val_2_vec, index_mask2),
                             ("*", index_forest_xor_3,

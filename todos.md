@@ -31,3 +31,5 @@ for i in range(0,batch_size)
 - 1536 is our max, that's 512+1024. 1024 is our max forest size
 - can we do everything with just 3 vars? no we cant, need scratch constants too
 - in that case then the tmp_addr could overflow. do we need a vselect 
+
+#4477
