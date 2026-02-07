@@ -657,6 +657,8 @@ class KernelBuilder:
                         ]
                     })
 
+            # OK NOW HOW TO MAKE ROUND 3 BETTER
+            
             else:
                 for i in range(0, batch_size, VLEN):
                     i_const = self.scratch_const(i)
