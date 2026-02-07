@@ -33,3 +33,5 @@ for i in range(0,batch_size)
 - in that case then the tmp_addr could overflow. do we need a vselect 
 
 #4477
+
+- ONCE WE HAVE EFFICIENT BUILD, IF WE HAVE EMPTY ALUS SHOULD WE CONVERT VALU OPS INTO 8 ALUS?

@@ -40,6 +40,8 @@ from problem import (
 class KernelBuilder:
     def __init__(self):
         self.instrs = []
+        # tuple ("engine",(op,etc))
+        self.interim_instrs = []
         self.scratch = {}
         self.scratch_debug = {}
         self.scratch_ptr = 0
@@ -49,7 +51,16 @@ class KernelBuilder:
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
-    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False, skip_debug=True):
+    def build(self, debug=False):
+        for (engine, op) in self.interim_instrs:
+            print(engine)
+            print(op)
+            if debug:
+                self.instrs.append({engine: [op]})
+            else:
+                if engine != "debug":
+                    self.instrs.append({engine: [op]})
+        return self.instrs
         # temporarily reverting while we vectorise everything
         # instrs = []
         # for engine, slot in slots:
@@ -122,8 +133,13 @@ class KernelBuilder:
 
         return instrs
 
-    def add(self, engine, slot):
-        self.instrs.append({engine: [slot]})
+    def add(self, engine, ops):
+        if (isinstance(ops, list)):
+            for op in ops:
+                self.interim_instrs.append((engine, op))
+        else:
+            self.interim_instrs.append((engine, ops))
+        # self.instrs.append({engine: [slot]})
 
     def alloc_scratch(self, name=None, length=1):
         addr = self.scratch_ptr
@@ -137,7 +153,7 @@ class KernelBuilder:
     def scratch_const(self, val, name=None):
         if val not in self.const_map:
             addr = self.alloc_scratch(name)
-            self.add("load", ("const", addr, val))
+            self.add("load", [("const", addr, val)])
             self.const_map[val] = addr
         return self.const_map[val]
 
@@ -154,15 +170,15 @@ class KernelBuilder:
             ops.append(("const", addr, val2))
             self.const_map[val2] = addr
         if len(ops) != 0:
-            self.instrs.append({"load": ops})
+            self.add("load", ops)
         return [self.const_map[val1], self.const_map[val2]]
         # return self.const_map[val]
 
     def scratch_vconst(self, val, name=None):
         if val not in self.vconst_map:
             addr = self.alloc_scratch(name, VLEN)
-            self.add("load", ("const", addr, val))
-            self.add("valu", ("vbroadcast", addr, addr))
+            self.add("load", [("const", addr, val)])
+            self.add("valu", [("vbroadcast", addr, addr)])
             self.vconst_map[val] = addr
         return self.vconst_map[val]
 
@@ -182,11 +198,12 @@ class KernelBuilder:
             self.vconst_map[val1] = addr1
             self.vconst_map[val3] = addr3
 
-        self.instrs.append({"load": loads[0:2]})
+        self.add("load", loads[0:2])
         for i in range(2, len(loads), 2):
-            self.instrs.append({"load": loads[i:i+2],
-                                "valu": vbroadcasts[i-2:i]})
-        self.instrs.append({"valu": vbroadcasts[-2:]})
+            self.add("load", loads[i:i+2])
+
+            self.add("valu", vbroadcasts[i-2:i])
+        self.add("valu", vbroadcasts[-2:])
 
     # all 3 vecs must be batch_size long
     # this only takes 80 cycles per call
@@ -218,30 +235,13 @@ class KernelBuilder:
         i = 0
         while len(valu_stage_2) + len(valu_stage_1) != 0:
             if i > 2:
-                self.instrs.append(
-                    {"valu": valu_stage_2[0:SLOT_LIMITS["valu"]]})
+                self.add("valu", valu_stage_2[0:SLOT_LIMITS["valu"]])
                 valu_stage_2 = valu_stage_2[SLOT_LIMITS["valu"]:]
             else:
-                self.instrs.append(
-                    {"valu": valu_stage_1[0:SLOT_LIMITS["valu"]]})
+                self.add(
+                    "valu", valu_stage_1[0:SLOT_LIMITS["valu"]])
                 valu_stage_1 = valu_stage_1[SLOT_LIMITS["valu"]:]
             i = (i+1) % 5
-
-        # for j in range(0, len(valu_stage_1) + len(valu_stage_2), SLOT_LIMITS["valu"]):
-        #     self.instrs.append(
-        #         {"valu": valu_stage_1[j:j+SLOT_LIMITS["valu"]]})
-        # for j in range(0, len(valu_stage_2), SLOT_LIMITS["valu"]):
-        #     self.instrs.append(
-        #         {"valu": valu_stage_2[j:j+SLOT_LIMITS["valu"]]})
-
-    def append_to_curr_cycle(self, engine, slot):
-        num_cycles = len(self.instrs)
-        if engine not in [engine for engine in self.instrs[num_cycles-1]] or len(self.instrs[num_cycles-1][engine]) >= SLOT_LIMITS[engine]:
-            self.instrs.append({engine: []})
-        num_cycles = len(self.instrs)
-        # print(engine)
-        # print(len(self.instrs[num_cycles-1][engine]))
-        self.instrs[num_cycles-1][engine].append(slot)
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
@@ -305,8 +305,8 @@ class KernelBuilder:
         input_values = self.alloc_scratch("input_values", batch_size)
         forest_level_0_val = self.alloc_scratch("forest_level_0_val")
 
-        self.instrs.append(
-            {"load": [("load", forest_level_0_val, self.scratch["forest_values_p"])]})
+        self.add(
+            "load", [("load", forest_level_0_val, self.scratch["forest_values_p"])])
         # keep all these contiguous, just feels right
         for i in range(0, batch_size, VLEN*2):
             if i+VLEN < batch_size:
@@ -326,68 +326,65 @@ class KernelBuilder:
         six_const = self.scratch_const(6)
 
         vlen_const = self.scratch_const(VLEN)
-        self.instrs.append({"alu": [
+        self.add("alu", [
             ("+", tmp_addr_2, self.scratch["inp_values_p"], zero_const),
             ("+", tmp_addr, self.scratch["inp_values_p"], vlen_const),
-        ],
-            "valu": [
-                ("vbroadcast", input_indices, zero_const),
-                ("vbroadcast", input_indices + VLEN, zero_const),
-        ]})
+        ])
+        self.add("valu", [
+            ("vbroadcast", input_indices, zero_const),
+            ("vbroadcast", input_indices + VLEN, zero_const),
+        ])
         # now we initially have tmp_addr and tmp_addr_2 populated
         for i in range(0, batch_size-VLEN*2, VLEN*2):
             i_const = self.scratch_const(i+VLEN*2)
             i_2nd_const = self.scratch_const(i+VLEN*3)
 
-            self.instrs.append({"load": [
+            self.add("load", [
                 ("vload", input_values + i, tmp_addr_2),
                 ("vload", input_values + i + VLEN, tmp_addr),
-            ],
-                "alu": [
+            ])
+
+            self.add("alu", [
                 ("+", tmp_addr_2, self.scratch["inp_values_p"], i_const),
                 ("+", tmp_addr, self.scratch["inp_values_p"], i_2nd_const),
-            ],
-                "valu": [
-                    ("vbroadcast", input_indices+i+2*VLEN, zero_const),
-                    ("vbroadcast", input_indices+i+3*VLEN, zero_const),
-            ]}
+            ])
+            self.add("valu", [
+                ("vbroadcast", input_indices+i+2*VLEN, zero_const),
+                ("vbroadcast", input_indices+i+3*VLEN, zero_const),
+            ]
             )
 
         final_offset = batch_size-VLEN*2
-        self.instrs.append({"load": [
+        self.add("load", [
             ("vload", input_values + final_offset, tmp_addr_2),
             ("vload", input_values + final_offset + VLEN, tmp_addr),
-        ],
-            # "valu": [
-            # ("vbroadcast", input_indices+final_offset, zero_const),
-            # ("vbroadcast", input_indices+final_offset + VLEN, zero_const),]
-        })
+        ])
         # theoretically at this point we now have all of our input indices and values in 2 256 contiguous blocks of memory
 
         for round in range(rounds):
             for i in range(0, batch_size, VLEN):
                 i_const = self.scratch_const(i)
                 # idx = mem[inp_indices_p + i]
-                self.instrs.append({"debug": [("vcompare", input_indices + i, [
+                self.add("debug", [("vcompare", input_indices + i, [
                     (round, i + j, "idx") for j in range(VLEN)]),
                     ("vcompare", input_values + i, [
                         (round, i + j, "val") for j in range(VLEN)])
-                ]})
-                self.append_to_curr_cycle("valu", ("+", forest_values_p_vec + i,
-                                                   self.scratch["forest_values_p"], input_indices+i))
+                ])
+                self.add("valu", ("+", forest_values_p_vec + i,
+                                  self.scratch["forest_values_p"], input_indices+i))
             # saves us 500 cycles
             if round % (forest_height+1) == 0:
                 for i in range(0, batch_size, VLEN*2):
-                    self.instrs.append(
-                        {"valu": [
+                    self.add(
+                        "valu", [
                             ("vbroadcast", forest_values_vec + i, forest_level_0_val),
                             ("vbroadcast", forest_values_vec +
                              i + VLEN, forest_level_0_val)
-                        ]})
+                        ])
                 for i in range(0, batch_size, VLEN):
                     i_const = self.scratch_const(i)
-                    self.append_to_curr_cycle("valu", ("^", input_values + i,
-                                                       input_values + i, forest_values_vec+i))
+                    self.add("valu", ("^", input_values + i,
+                                      input_values + i, forest_values_vec+i))
             elif round % (forest_height + 1) == 1:
                 # prev approach - maybe more efficient? tbd on cycle packing
                 #
@@ -400,44 +397,47 @@ class KernelBuilder:
                 index_mask = forest_values_vec+offset
                 index_forest_xor_1 = forest_values_vec + offset + VLEN
                 index_forest_xor_2 = forest_values_vec + offset + 2*VLEN
-                self.instrs.append(
-                    {"alu": [("+", tmp_addr, self.scratch["forest_values_p"], one_const)],
-                     "flow": [("add_imm", tmp_addr_2, self.scratch["forest_values_p"], 2)]})
-                self.instrs.append(
-                    {"load": [("load", forest_val_1, tmp_addr),
-                              ("load", forest_val_2, tmp_addr_2)]})
-                self.instrs.append({
-                    "valu": [
+                self.add(
+                    "alu", [("+", tmp_addr, self.scratch["forest_values_p"], one_const)])
+                self.add(
+                    "flow", [("add_imm", tmp_addr_2, self.scratch["forest_values_p"], 2)])
+                self.add(
+                    "load", [("load", forest_val_1, tmp_addr),
+                             ("load", forest_val_2, tmp_addr_2)])
+                self.add(
+                    "valu", [
                         ("vbroadcast", forest_val_1_vec, forest_val_1),
                         ("vbroadcast", forest_val_2_vec, forest_val_2),
                     ]
-                })
+                )
                 # at this point our forest_values_vec has the 1st level of our forest loaded in at indexes 1 and 2
                 # if our input_indices has a lsb of 0, we need forest_values_vec[0], otherwise 1
                 # let's use forest_values_vec + 128 for this
                 # creating our mask as well as a and b options
-                self.instrs.append({
-                    "valu": [("&", index_mask, one_vec_const, input_indices),
+                self.add(
+                    "valu", [("&", index_mask, one_vec_const, input_indices),
                              ("^", index_forest_xor_1,
                               input_values, forest_val_1_vec),
                              ("^", index_forest_xor_2,
                               input_values, forest_val_2_vec),
                              ]
-                })
+                )
                 # forest_values_vec now has a mask
                 for i in range(VLEN, batch_size, VLEN):
-                    self.instrs.append({
-                        "valu": [("&", index_mask, one_vec_const, input_indices + i),
+                    self.add("flow", [("vselect", input_values+i - VLEN, index_mask, index_forest_xor_1, index_forest_xor_2)]
+                             )
+                    self.add(
+                        "valu", [("&", index_mask, one_vec_const, input_indices + i),
                                  ("^", index_forest_xor_1,
-                                  input_values+i, forest_val_1_vec),
+                                 input_values+i, forest_val_1_vec),
                                  ("^", index_forest_xor_2,
-                                  input_values+i, forest_val_2_vec),
-                                 ],
-                        "flow": [("vselect", input_values+i - VLEN, index_mask, index_forest_xor_1, index_forest_xor_2)]
-                    })
-                self.instrs.append({
-                    "flow": [("vselect", input_values+batch_size-VLEN, index_mask, index_forest_xor_1, index_forest_xor_2)]
-                })
+                                 input_values+i, forest_val_2_vec),
+                                 ])
+
+                self.add(
+                    "flow", [("vselect", input_values+batch_size-VLEN,
+                              index_mask, index_forest_xor_1, index_forest_xor_2)]
+                )
 
                 # ======== diff impl
 
@@ -458,22 +458,22 @@ class KernelBuilder:
                 # index_forest_xor_4 = forest_values_vec + offset + 9*VLEN
                 # index_forest_xor_5 = forest_values_vec + offset + 10*VLEN
                 # index_forest_xor_6 = forest_values_vec + offset + 12*VLEN
-                # self.instrs.append(
-                #     {"alu": [("+", tmp_addr, self.scratch["forest_values_p"], one_const),
+                # self.add(
+                #     "alu", [("+", tmp_addr, self.scratch["forest_values_p"], one_const),
                 #              ("+", tmp_addr_2, self.scratch["forest_values_p"], two_const)],
-                #      })
-                # self.instrs.append(
-                #     {"load": [("load", forest_val_1, tmp_addr),
-                #               ("load", forest_val_2, tmp_addr_2)]})
-                # self.instrs.append({
-                #     "valu": [
+                #      )
+                # self.add(
+                #     "load", [("load", forest_val_1, tmp_addr),
+                #               ("load", forest_val_2, tmp_addr_2)])
+                # self.add({
+                #     "valu", [
                 #         ("vbroadcast", forest_val_1_vec, forest_val_1),
                 #         ("vbroadcast", forest_val_2_vec, forest_val_2),
                 #     ]
-                # })
+                # )
 
-                # self.instrs.append({
-                #     "valu": [
+                # self.add({
+                #     "valu", [
                 #         ("==", index_mask, one_vec_const, input_indices),
                 #         # lsb 0 -> index 2
                 #         ("==", index_mask2, two_vec_const,
@@ -482,9 +482,9 @@ class KernelBuilder:
                 #          input_indices + VLEN),
                 #         ("==", index_mask4, two_vec_const, input_indices+VLEN)
                 #     ]
-                # })
-                # self.instrs.append({
-                #     "valu": [
+                # )
+                # self.add({
+                #     "valu", [
                 #         ("*", index_forest_xor_1, index_mask, forest_val_1_vec),
                 #         ("*", index_forest_xor_2,
                 #          index_mask2, forest_val_2_vec),
@@ -493,11 +493,11 @@ class KernelBuilder:
                 #         ("*", index_forest_xor_4,
                 #          index_mask4, forest_val_2_vec),
                 #     ]
-                # })
+                # )
 
                 # for i in range(2*VLEN, batch_size, VLEN*2):
-                #     self.instrs.append({
-                #         "valu": [("==", index_mask, one_vec_const, input_indices + i),
+                #     self.add({
+                #         "valu", [("==", index_mask, one_vec_const, input_indices + i),
                 #                  # lsb 0 -> index 2
                 #                  ("==", index_mask2, two_vec_const,
                 #                   input_indices + i),
@@ -511,9 +511,9 @@ class KernelBuilder:
                 #                  ("^", input_values-VLEN+i, input_values -
                 #                   VLEN+i, index_forest_xor_3),
                 #                  ]
-                #     })
-                #     self.instrs.append({
-                #         "valu": [
+                #     )
+                #     self.add({
+                #         "valu", [
                 #             ("*", index_forest_xor_1, index_mask, forest_val_1_vec),
                 #             ("*", index_forest_xor_2,
                 #              index_mask2, forest_val_2_vec),
@@ -528,26 +528,26 @@ class KernelBuilder:
                 #              VLEN+i, index_forest_xor_4),
                 #             # ("*", index_forest_xor_4, index_mask3, forest_val_2_vec),
                 #         ]
-                #     })
+                #     )
 
-                # self.instrs.append({
-                #     "valu": [
+                # self.add({
+                #     "valu", [
                 #         ("^", input_values-2*VLEN+batch_size,
                 #          input_values-2*VLEN+batch_size, index_forest_xor_1),
                 #         # ("*", index_forest_xor_1, index_mask, forest_val_1_vec),
                 #         ("^", input_values-VLEN+batch_size, input_values -
                 #          VLEN+batch_size, index_forest_xor_3),
                 #     ]
-                # })
-                # self.instrs.append({
-                #     "valu": [
+                # )
+                # self.add({
+                #     "valu", [
                 #         ("^", input_values-2*VLEN+batch_size, input_values -
                 #          2*VLEN+batch_size, index_forest_xor_2),
                 #         # ("*", index_forest_xor_2, index_mask, forest_val_2_vec),
                 #         ("^", input_values-VLEN+batch_size, input_values -
                 #          VLEN+batch_size, index_forest_xor_4),
                 #     ]
-                # })
+                # )
 
             elif round % (forest_height+1) == 2:
                 # our input_indices are [1,1,2,1,2,2,1,2,...]
@@ -581,50 +581,52 @@ class KernelBuilder:
                 index_forest_xor_3 = forest_values_vec + offset + VLEN*6
                 index_forest_xor_4 = forest_values_vec + offset + VLEN*7
 
-                self.instrs.append(
-                    {"alu": [("+", addr1, self.scratch["forest_values_p"], three_const),
-                             ("+", addr2,
-                              self.scratch["forest_values_p"], four_const),
-                             ("+", addr3,
-                              self.scratch["forest_values_p"], five_const),
-                             ("+", addr4,
-                              self.scratch["forest_values_p"], six_const)
-                             ]})
-                self.instrs.append(
-                    {"load": [("load", forest_val_1, addr1),
-                              ("load", forest_val_2, addr2)],
-                     "valu": [
-                         ("vbroadcast", three_vconst, three_const),
-                         ("vbroadcast", four_vconst, four_const),
-                         ("vbroadcast", five_vconst, five_const),
-                         ("vbroadcast", six_vconst, six_const),
-                    ]
-                    })
-                self.instrs.append({
-                    "load": [("load", forest_val_3, addr3),
-                             ("load", forest_val_4, addr4)],
-                    "valu": [
+                self.add(
+                    "alu", [("+", addr1, self.scratch["forest_values_p"], three_const),
+                            ("+", addr2,
+                            self.scratch["forest_values_p"], four_const),
+                            ("+", addr3,
+                            self.scratch["forest_values_p"], five_const),
+                            ("+", addr4,
+                            self.scratch["forest_values_p"], six_const)
+                            ])
+                self.add(
+                    "load", [("load", forest_val_1, addr1),
+                             ("load", forest_val_2, addr2)])
+
+                self.add("valu", [
+                    ("vbroadcast", three_vconst, three_const),
+                    ("vbroadcast", four_vconst, four_const),
+                    ("vbroadcast", five_vconst, five_const),
+                    ("vbroadcast", six_vconst, six_const),
+                ]
+                )
+                self.add(
+                    "load", [("load", forest_val_3, addr3),
+                             ("load", forest_val_4, addr4)])
+
+                self.add("valu", [
                         ("vbroadcast", forest_val_1_vec, forest_val_1),
                         ("vbroadcast", forest_val_2_vec, forest_val_2),
-                    ]
-                })
-                self.instrs.append({
-                    "valu": [("vbroadcast", forest_val_3_vec, forest_val_3),
+                ]
+                )
+                self.add(
+                    "valu", [("vbroadcast", forest_val_3_vec, forest_val_3),
                              ("vbroadcast", forest_val_4_vec, forest_val_4),]
-                })
+                )
 
                 for i in range(0, batch_size, VLEN):
-                    self.instrs.append({
-                        "valu": [
+                    self.add(
+                        "valu", [
                             ("==", index_mask, input_indices+i, three_vconst),
                             ("==", index_mask2, input_indices+i, four_vconst),
                             ("==", index_mask3, input_indices+i, five_vconst),
                             ("==", index_mask4, input_indices+i, six_vconst),
                         ]
-                    })
+                    )
 
-                    self.instrs.append({
-                        "valu": [
+                    self.add(
+                        "valu", [
                             ("*", index_forest_xor_1,
                              forest_val_1_vec, index_mask),
                             ("*", index_forest_xor_2,
@@ -634,31 +636,31 @@ class KernelBuilder:
                             ("*", index_forest_xor_4,
                              forest_val_4_vec, index_mask4),
                         ]
-                    })
+                    )
 
-                    self.instrs.append({
-                        "valu": [
+                    self.add(
+                        "valu", [
                             ("^", input_values+i, input_values+i, index_forest_xor_1)
                         ]
-                    })
-                    self.instrs.append({
-                        "valu": [
+                    )
+                    self.add(
+                        "valu", [
                             ("^", input_values+i, input_values+i, index_forest_xor_2)
                         ]
-                    })
-                    self.instrs.append({
-                        "valu": [
+                    )
+                    self.add(
+                        "valu", [
                             ("^", input_values+i, input_values+i, index_forest_xor_3)
                         ]
-                    })
-                    self.instrs.append({
-                        "valu": [
+                    )
+                    self.add(
+                        "valu", [
                             ("^", input_values+i, input_values+i, index_forest_xor_4)
                         ]
-                    })
+                    )
 
             # OK NOW HOW TO MAKE ROUND 3 BETTER
-            
+
             else:
                 for i in range(0, batch_size, VLEN):
                     i_const = self.scratch_const(i)
@@ -670,20 +672,20 @@ class KernelBuilder:
                     # if we need to load 8 things at once we need to vload
                     # but vload loads a block of 8 contiguous values from main memory into scratch
                     for k in range(0, VLEN, 2):
-                        self.instrs.append({"load": [
+                        self.add("load", [
                             ("load", forest_values_vec + i +
                              k, forest_values_p_vec + i + k),
                             ("load", forest_values_vec + i +
                              k+1, forest_values_p_vec + i + k+1)
-                        ]})
+                        ])
 
                     self.add("debug", ("vcompare", forest_values_vec+i, [
                         (round, i + j, "node_val") for j in range(VLEN)]))
 
                 for i in range(0, batch_size, VLEN):
                     i_const = self.scratch_const(i)
-                    self.append_to_curr_cycle("valu", ("^", input_values + i,
-                                                       input_values + i, forest_values_vec+i))
+                    self.add("valu", ("^", input_values + i,
+                                      input_values + i, forest_values_vec+i))
 
             print(len(self.instrs))
             # this is 150 cycles each round
@@ -700,26 +702,26 @@ class KernelBuilder:
             for i in range(0, batch_size, VLEN):
                 i_const = self.scratch_const(i)
                 # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                self.append_to_curr_cycle("valu", ("%", forest_values_p_vec + i,
-                                                   input_values + i, two_vec_const))
+                self.add("valu", ("%", forest_values_p_vec + i,
+                                  input_values + i, two_vec_const))
 
             for i in range(0, batch_size, VLEN):
                 i_const = self.scratch_const(i)
-                self.append_to_curr_cycle(
+                self.add(
                     "valu", ("+", forest_values_p_vec + i, forest_values_p_vec + i, one_vec_const))
 
             # this does almost nothing lmao saves us like 50 cycles
             if round == forest_height:
                 for i in range(0, batch_size, VLEN):
-                    self.append_to_curr_cycle(
+                    self.add(
                         "valu", ("vbroadcast", input_indices+i, zero_vec_const))
             else:
                 for i in range(0, batch_size, VLEN):
                     i_const = self.scratch_const(i)
                     # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                    self.append_to_curr_cycle("valu", ("multiply_add", input_indices+i,
-                                                       input_indices+i, two_vec_const, forest_values_p_vec + i))
-                    self.append_to_curr_cycle("debug", ("vcompare", input_indices+i, [
+                    self.add("valu", ("multiply_add", input_indices+i,
+                                      input_indices+i, two_vec_const, forest_values_p_vec + i))
+                    self.add("debug", ("vcompare", input_indices+i, [
                         (round, i + j, "next_idx") for j in range(VLEN)]))
                     # idx = 0 if idx >= n_nodes else idx
                     # WHAT IS THE IDX VALUE CUTOFF FOR WRAPPING?
@@ -730,43 +732,51 @@ class KernelBuilder:
                     # idx 500 -> wrap
 
                 for i in range(0, batch_size, VLEN):
-                    self.append_to_curr_cycle(
+                    self.add(
                         "valu", ("%", input_indices+i, input_indices+i, self.scratch["n_nodes"]))
 
                 for i in range(0, batch_size, VLEN):
                     # i_const = self.scratch_const(i)
-                    # self.append_to_curr_cycle("flow", ("vselect", input_indices+i,
+                    # self.add("flow", ("vselect", input_indices+i,
                     #                                    tmp_vec_batch_size + i, input_indices+i, zero_vec_const))
-                    self.append_to_curr_cycle("debug", ("vcompare", input_indices+i, [
+                    self.add("debug", ("vcompare", input_indices+i, [
                         (round, i + j, "wrapped_idx") for j in range(VLEN)]))
 
                 # mem[inp_indices_p + i] = idx
 
         # Required to match with the yield in reference_kernel2
         i_const = self.scratch_const(0)
-        self.instrs.append({"alu": [("+", tmp_addr, self.scratch["inp_indices_p"],
-                                     i_const), ("+", tmp_addr_2, self.scratch["inp_values_p"], i_const)]})
+        self.add("alu", [("+", tmp_addr, self.scratch["inp_indices_p"],
+                          i_const), ("+", tmp_addr_2, self.scratch["inp_values_p"], i_const)])
 
         # WE NEED TO VSTORE AT THE input_indices_p and input_values_p
         # now we initially have tmp_addr and tmp_addr_2 populated
         for i in range(0, batch_size-VLEN, VLEN):
             i_const = self.scratch_const(i+VLEN)
 
-            self.instrs.append({"store": [
+            self.add("store", [
                 ("vstore", tmp_addr, input_indices + i),
                 ("vstore", tmp_addr_2, input_values + i)
-            ],
-                "alu": [
+            ])
+            self.add("alu", [
                 ("+", tmp_addr, self.scratch["inp_indices_p"],
-                 i_const), ("+", tmp_addr_2, self.scratch["inp_values_p"], i_const)]}
+                 i_const), ("+", tmp_addr_2, self.scratch["inp_values_p"], i_const)]
             )
 
         final_offset = batch_size-VLEN
-        self.instrs.append({"store": [
+        self.add("store", [
             ("vstore", tmp_addr, input_indices + final_offset),
             ("vstore", tmp_addr_2, input_values + final_offset)
-        ]})
+        ])
         self.add("flow", ("pause",))
+
+        instrs = self.build(True)
+        counts = {"valu": 0, "alu": 0, "load": 0,
+                  "debug": 0, "flow": 0, "store": 0}
+        for instr in instrs:
+            engine, = instr.keys()
+            counts[engine] = counts[engine]+1
+        print(counts)
 
 
 BASELINE = 147734
