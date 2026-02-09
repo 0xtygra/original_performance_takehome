@@ -265,8 +265,6 @@ class KernelBuilder:
     # all 3 vecs must be batch_size long
     # this only takes 80 cycles per call
     def build_hash(self, input_values_vec, tmp_vec_1, tmp_vec_2, round, i, batch_size):
-        valu_stage_1 = []
-        valu_stage_2 = []
         for hash_index, (op1, val1, op2, op3, val3) in enumerate[
             tuple[str, int, str, str, int]
         ](HASH_STAGES):
@@ -277,28 +275,19 @@ class KernelBuilder:
             # instead we can multiply input and add the result of the first add in the same op
             for j in range(0, batch_size, VLEN):
                 if hash_index % 2 == 0:
-                    valu_stage_1.append((op1, tmp_vec_1 + j, input_values_vec + j,
-                                        self.scratch_vconst(val1)))
-                    valu_stage_2.append(("multiply_add", input_values_vec + j, input_values_vec + j, self.scratch_vconst(val3),
-                                        tmp_vec_1 + j))
+                    self.add("valu", [(op1, tmp_vec_1 + j, input_values_vec + j,
+                                      self.scratch_vconst(val1)),
+                                      ("multiply_add", input_values_vec + j, input_values_vec + j, self.scratch_vconst(val3),
+                                      tmp_vec_1 + j)
+                                      ])
                 else:
-                    valu_stage_1.append((op1, tmp_vec_1 + j, input_values_vec + j,
-                                        self.scratch_vconst(val1)))
-                    valu_stage_1.append((op3, tmp_vec_2 + j, input_values_vec + j,
-                                        self.scratch_vconst(val3)))
-                    valu_stage_2.append(
-                        (op2, input_values_vec + j, tmp_vec_1 + j, tmp_vec_2 + j))
-
-        i = 0
-        while len(valu_stage_2) + len(valu_stage_1) != 0:
-            if i > 2:
-                self.add("valu", valu_stage_2[0:SLOT_LIMITS["valu"]])
-                valu_stage_2 = valu_stage_2[SLOT_LIMITS["valu"]:]
-            else:
-                self.add(
-                    "valu", valu_stage_1[0:SLOT_LIMITS["valu"]])
-                valu_stage_1 = valu_stage_1[SLOT_LIMITS["valu"]:]
-            i = (i+1) % 5
+                    self.add("valu", [(op1, tmp_vec_1 + j, input_values_vec + j,
+                                      self.scratch_vconst(val1)),
+                                      (op3, tmp_vec_2 + j, input_values_vec + j,
+                                      self.scratch_vconst(val3)),
+                                      (op2, input_values_vec + j,
+                                      tmp_vec_1 + j, tmp_vec_2 + j)
+                                      ])
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
@@ -430,6 +419,7 @@ class KernelBuilder:
                 self.add("valu", ("+", forest_values_p_vec + i,
                                   self.scratch["forest_values_p"], input_indices+i))
             # saves us 500 cycles
+            curr_interim_instrs = len(self.interim_instrs)
             if round % (forest_height+1) == 0:
                 for i in range(0, batch_size, VLEN*2):
                     self.add(
@@ -446,6 +436,7 @@ class KernelBuilder:
                 # prev approach - maybe more efficient? tbd on cycle packing
                 #
                 # our input_indices are [1,1,2,1,2,2,1,2,...]
+                # ===== diff impl
                 forest_val_1 = forest_values_vec
                 forest_val_2 = forest_values_vec + 1
                 forest_val_1_vec = forest_values_vec+VLEN
@@ -521,19 +512,19 @@ class KernelBuilder:
                 # index_forest_xor_6 = forest_values_vec + offset + 12*VLEN
                 # self.add(
                 #     "alu", [("+", tmp_addr, self.scratch["forest_values_p"], one_const),
-                #              ("+", tmp_addr_2, self.scratch["forest_values_p"], two_const)],
-                #      )
+                #             ("+", tmp_addr_2, self.scratch["forest_values_p"], two_const)],
+                # )
                 # self.add(
                 #     "load", [("load", forest_val_1, tmp_addr),
-                #               ("load", forest_val_2, tmp_addr_2)])
-                # self.add({
+                #              ("load", forest_val_2, tmp_addr_2)])
+                # self.add(
                 #     "valu", [
                 #         ("vbroadcast", forest_val_1_vec, forest_val_1),
                 #         ("vbroadcast", forest_val_2_vec, forest_val_2),
                 #     ]
                 # )
 
-                # self.add({
+                # self.add(
                 #     "valu", [
                 #         ("==", index_mask, one_vec_const, input_indices),
                 #         # lsb 0 -> index 2
@@ -544,7 +535,7 @@ class KernelBuilder:
                 #         ("==", index_mask4, two_vec_const, input_indices+VLEN)
                 #     ]
                 # )
-                # self.add({
+                # self.add(
                 #     "valu", [
                 #         ("*", index_forest_xor_1, index_mask, forest_val_1_vec),
                 #         ("*", index_forest_xor_2,
@@ -557,7 +548,7 @@ class KernelBuilder:
                 # )
 
                 # for i in range(2*VLEN, batch_size, VLEN*2):
-                #     self.add({
+                #     self.add(
                 #         "valu", [("==", index_mask, one_vec_const, input_indices + i),
                 #                  # lsb 0 -> index 2
                 #                  ("==", index_mask2, two_vec_const,
@@ -573,8 +564,14 @@ class KernelBuilder:
                 #                   VLEN+i, index_forest_xor_3),
                 #                  ]
                 #     )
-                #     self.add({
+
+                #     self.add(
                 #         "valu", [
+                #             ("^", input_values-2*VLEN+i, input_values -
+                #              2*VLEN+i, index_forest_xor_2),
+                #             # ("*", index_forest_xor_2, index_mask, forest_val_2_vec),
+                #             ("^", input_values-VLEN+i, input_values -
+                #              VLEN+i, index_forest_xor_4),
                 #             ("*", index_forest_xor_1, index_mask, forest_val_1_vec),
                 #             ("*", index_forest_xor_2,
                 #              index_mask2, forest_val_2_vec),
@@ -582,16 +579,11 @@ class KernelBuilder:
                 #              index_mask3, forest_val_1_vec),
                 #             ("*", index_forest_xor_4,
                 #              index_mask4, forest_val_2_vec),
-                #             ("^", input_values-2*VLEN+i, input_values -
-                #              2*VLEN+i, index_forest_xor_2),
-                #             # ("*", index_forest_xor_2, index_mask, forest_val_2_vec),
-                #             ("^", input_values-VLEN+i, input_values -
-                #              VLEN+i, index_forest_xor_4),
                 #             # ("*", index_forest_xor_4, index_mask3, forest_val_2_vec),
                 #         ]
                 #     )
 
-                # self.add({
+                # self.add(
                 #     "valu", [
                 #         ("^", input_values-2*VLEN+batch_size,
                 #          input_values-2*VLEN+batch_size, index_forest_xor_1),
@@ -600,7 +592,7 @@ class KernelBuilder:
                 #          VLEN+batch_size, index_forest_xor_3),
                 #     ]
                 # )
-                # self.add({
+                # self.add(
                 #     "valu", [
                 #         ("^", input_values-2*VLEN+batch_size, input_values -
                 #          2*VLEN+batch_size, index_forest_xor_2),
@@ -747,17 +739,24 @@ class KernelBuilder:
                     i_const = self.scratch_const(i)
                     self.add("valu", ("^", input_values + i,
                                       input_values + i, forest_values_vec+i))
+            print(
+                f"round: {round}, stage: loading and xoring forest values, new instrs: {len(self.interim_instrs) - curr_interim_instrs}")
 
+            curr_interim_instrs = len(self.interim_instrs)
             # this is 150 cycles each round
             # 256 elements in the vector, 3 parts of each hash stage, 6 hash stages
             # valu 6 slot limit + doing 8 at a time
             # -> 256 * 3 * 6 / (6*8) = 96
             self.build_hash(input_values, forest_values_p_vec,
                             forest_values_vec, round, i, batch_size)
+            print(
+                f"round: {round}, stage: building hash, new instrs: {len(self.interim_instrs) - curr_interim_instrs}")
+
             for i in range(0, batch_size, VLEN):
                 self.add("debug", ("vcompare", input_values + i, [
                          (round, i + j, "hashed_val") for j in range(VLEN)]))
 
+            curr_interim_instrs = len(self.interim_instrs)
             for i in range(0, batch_size, VLEN):
                 i_const = self.scratch_const(i)
                 # idx = 2*idx + (1 if val % 2 == 0 else 2)
@@ -802,6 +801,8 @@ class KernelBuilder:
                         (round, i + j, "wrapped_idx") for j in range(VLEN)]))
 
                 # mem[inp_indices_p + i] = idx
+            print(
+                f"round: {round}, stage: calc and wrapping next index, new instrs: {len(self.interim_instrs) - curr_interim_instrs}")
 
         # Required to match with the yield in reference_kernel2
         i_const = self.scratch_const(0)
@@ -830,12 +831,17 @@ class KernelBuilder:
         self.add("flow", ("pause",))
 
         instrs = self.build(True)
-        counts = {"valu": 0, "alu": 0, "load": 0,
-                  "debug": 0, "flow": 0, "store": 0}
+        cycle_counts = {"valu": 0, "alu": 0, "load": 0,
+                        "debug": 0, "flow": 0, "store": 0}
+        engine_counts = {"valu": 0, "alu": 0, "load": 0,
+                         "debug": 0, "flow": 0, "store": 0}
         for instr in instrs:
-            for engine, _ops in instr.items():
-                counts[engine] = counts[engine]+1
-        print(counts)
+            for engine, ops in instr.items():
+                cycle_counts[engine] = cycle_counts[engine]+1
+                for _op in ops:
+                    engine_counts[engine] = engine_counts[engine]+1
+        print(cycle_counts)
+        print(engine_counts)
         print(len(self.instrs))
 
 
