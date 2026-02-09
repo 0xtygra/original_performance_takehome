@@ -37,6 +37,87 @@ from problem import (
 )
 
 
+def calc_cycle_inputs_outputs(inputs, outputs, engine, engine_instrs):
+    if engine == "alu":
+        for instr in engine_instrs:
+            inputs.add(instr[2])
+            inputs.add(instr[3])
+            outputs.add(instr[1])
+    # same as alu but vector
+    elif engine == "valu":
+        for instr in engine_instrs:
+            if instr[0] == "vbroadcast":
+                inputs.add(instr[2])
+                for j in range(VLEN):
+                    outputs.add(instr[1]+j)
+            elif instr[0] == "multiply_add":
+                for j in range(VLEN):
+                    outputs.add(instr[1]+j)
+                    inputs.add(instr[2]+j)
+                    inputs.add(instr[3]+j)
+                    inputs.add(instr[4]+j)
+            else:
+                for j in range(VLEN):
+                    inputs.add(instr[2]+j)
+                    inputs.add(instr[3]+j)
+                    outputs.add(instr[1]+j)
+    elif engine == "load":
+        for instr in engine_instrs:
+            outputs.add(instr[1])
+            if instr[0] == "load":
+                inputs.add(instr[2])
+            elif instr[0] == "vload":
+                for j in range(VLEN):
+                    inputs.add(instr[2]+j)
+            elif instr[0] == "const":
+                outputs.add(instr[1])
+            else:
+                raise NotImplementedError(
+                    f"Unknown op {engine} {instr[0]}")
+            # kind of ignore load_offset for now, dont really use it
+    elif engine == "store":
+        # NEED TO THINK THROUGH THIS MORE, NOT A PROBLEM FOR OUR USE
+        # CASE THOUGH AS WE ONLY STORE ONCE AT THE END
+        for instr in engine_instrs:
+            if instr[0] == "store":
+                inputs.add(instr[2])
+                inputs.add(instr[1])
+            elif instr[0] == "vstore":
+                for j in range(VLEN):
+                    inputs.add(instr[2]+j)
+                    inputs.add(instr[1]+j)
+            else:
+                raise NotImplementedError(
+                    f"Unknown op {engine} {instr[0]}")
+    elif engine == "flow":
+        for instr in engine_instrs:
+            if instr[0] == "vselect":
+                for j in range(VLEN):
+                    inputs.add(instr[2]+j)
+                    inputs.add(instr[4]+j)
+                    inputs.add(instr[3]+j)
+                    outputs.add(instr[1]+j)
+            elif instr[0] == "add_imm":
+                inputs.add(instr[2])
+                outputs.add(instr[1])
+            elif instr[0] == "pause":
+                # do nothing
+                a = 1
+            else:
+                raise NotImplementedError(
+                    f"Unknown op {engine} {instr[0]}")
+    elif engine == "debug":
+        for instr in engine_instrs:
+            if instr[0] == "compare":
+                inputs.add(instr[1])
+            if instr[0] == "vcompare":
+                for j in range(VLEN):
+                    inputs.add(instr[1] + j)
+
+    else:
+        raise NotImplementedError(f"Unknown op {engine}")
+
+
 class KernelBuilder:
     def __init__(self):
         self.instrs = []
@@ -51,87 +132,63 @@ class KernelBuilder:
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
+    def place_op_in_earliest_available_cycle(self, engine, op, earliest_valid_cycle_idx):
+        for i in range(earliest_valid_cycle_idx, len(self.instrs)):
+            curr_instr = self.instrs[i]
+            if engine not in curr_instr:
+                curr_instr[engine] = []
+            if len(curr_instr[engine]) < SLOT_LIMITS[engine]:
+                self.instrs[i][engine].append(op)
+                return
+        self.instrs.append({engine: [op]})
+        return
+
+    # TODO: make it a bit smarter such that we can put reads and writes in the same
+    # cycle where possible
     def build(self, debug=False):
-        for (engine, op) in self.interim_instrs:
-            print(engine)
-            print(op)
-            if debug:
-                self.instrs.append({engine: [op]})
-            else:
-                if engine != "debug":
-                    self.instrs.append({engine: [op]})
+        self.instrs.append({})
+        for ii, (engine, op) in enumerate(self.interim_instrs):
+
+            instrs_len = len(self.instrs)
+            for i in range(instrs_len):
+                curr_idx = instrs_len-i-1
+                curr_cycle = self.instrs[curr_idx]
+                curr_cycle_inputs = set()
+                curr_cycle_outputs = set()
+                for tmp_eng, instrs in curr_cycle.items():
+                    calc_cycle_inputs_outputs(
+                        curr_cycle_inputs, curr_cycle_outputs, tmp_eng, instrs)
+                # now we know all the inputs and outputs for our current cycle
+                # time to check if our current instruction has any conflicts
+                curr_instr_inputs = set()
+                curr_instr_outputs = set()
+                calc_cycle_inputs_outputs(
+                    curr_instr_inputs, curr_instr_outputs, engine, [op])
+                # our current instruction has an input that is mutated in this cycle -> CANT GO IN THIS CYCLE
+                if curr_instr_inputs & curr_cycle_outputs:
+                    self.place_op_in_earliest_available_cycle(
+                        engine, op, curr_idx+1)
+                    break
+                if curr_instr_outputs & curr_cycle_inputs:
+                    self.place_op_in_earliest_available_cycle(
+                        engine, op, curr_idx)
+                    break
+                if engine == "flow" and op[0] == "pause":
+                    self.place_op_in_earliest_available_cycle(
+                        engine, op, curr_idx)
+                    break
+                # if we get here then we can go back further
+                # if this is the first cycle though then we gotta put it in
+                if curr_idx == 0:
+                    self.place_op_in_earliest_available_cycle(engine, op, 0)
+                    break
+
         return self.instrs
-        # temporarily reverting while we vectorise everything
-        # instrs = []
-        # for engine, slot in slots:
-        #     instrs.append({engine: [slot]})
-        # return instrs
-        # Simple slot packing that just uses one slot per instruction bundle
-        instrs = []
-        instrs_len = 0
-        curr_dests = {"alu": {},  "store": {}, "load": {}, "flow": {}}
-        prev_engine = None
-        # NEXT THING TO DO
-        # BE ABLE TO HANDLE ALU -> LOAD -> ALU INTO 1 CYCLE
-        # additionally be able to handle ALU -> load -> load -> load -> ALU if none of the ALUs depend on the loads, even if the interim loads are multiple cycles on their own
-        for engine, slot in slots:
-            if instrs_len == 0:
-                instrs.append({engine: [slot]})
-                curr_dests = {engine: {slot[1]: True}}
-                instrs_len += 1
-                continue
-            curr_engine_len = (
-                0
-                if engine not in instrs[instrs_len - 1]
-                else len(instrs[instrs_len - 1][engine])
-            )
 
-            if engine == "debug" and skip_debug:
-                continue
-            if prev_engine == engine:
-                if engine == "alu" and curr_engine_len < SLOT_LIMITS[engine]:
-                    # simple for now - ensure that the instr we want to pack into the same cycle doesnt depend on the write from the prev alu
-                    if (
-                        slot[2] not in curr_dests[engine]
-                        and slot[3] not in curr_dests[engine]
-                    ):
-                        instrs[instrs_len - 1][engine].append(slot)
-                        curr_dests[engine][slot[1]] = True
-                # COMMENTED OUT AS NOT WORKING WITH MULTIPLYADD
-                # elif engine == "valu" and curr_engine_len < SLOT_LIMITS[engine]:
-                #     # simple for now - ensure that the instr we want to pack into the same cycle doesnt depend on the write from the prev alu
-                #     if (
-                #         slot[2] not in curr_dests[engine]
-                #         and slot[3] not in curr_dests[engine]
-                #     ):
-                #         instrs[instrs_len - 1][engine].append(slot)
-                #         curr_dests[engine][slot[1]] = True
-                elif engine == "store" and curr_engine_len < SLOT_LIMITS[engine]:
-                    instrs[instrs_len - 1][engine].append(slot)
-                    # curr_dests irrelevant for store i believe, we can overwrite
-                    # curr_dests[engine][slot[2]] = True
-                elif engine == "load" and curr_engine_len < SLOT_LIMITS[engine]:
-                    instrs[instrs_len - 1][engine].append(slot)
-                else:
-                    instrs.append({engine: [slot]})
-                    curr_dests[engine] = {slot[1]: True}
-                    instrs_len += 1
-                    prev_engine = engine
-                    continue
-
-            new_engine_len = (
-                0
-                if engine not in instrs[instrs_len - 1]
-                else len(instrs[instrs_len - 1][engine])
-            )
-            # we werent able to add new instr into current cycle
-            if curr_engine_len == new_engine_len:
-                instrs.append({engine: [slot]})
-                curr_dests = {engine: {slot[1]: True}}
-                instrs_len += 1
-            prev_engine = engine
-
-        return instrs
+        # every op has inputs and outputs
+        # in general, we can move an op back in cycles as long as we want until:
+        # one of our inputs is another output, or
+        # our output is another output
 
     def add(self, engine, ops):
         if (isinstance(ops, list)):
@@ -400,7 +457,11 @@ class KernelBuilder:
                 self.add(
                     "alu", [("+", tmp_addr, self.scratch["forest_values_p"], one_const)])
                 self.add(
-                    "flow", [("add_imm", tmp_addr_2, self.scratch["forest_values_p"], 2)])
+                    "alu", [
+                        ("+", tmp_addr_2, self.scratch["forest_values_p"], two_const)]
+                )
+                # self.add(
+                #     "flow", [("add_imm", tmp_addr_2, self.scratch["forest_values_p"], 2)])
                 self.add(
                     "load", [("load", forest_val_1, tmp_addr),
                              ("load", forest_val_2, tmp_addr_2)])
@@ -687,7 +748,6 @@ class KernelBuilder:
                     self.add("valu", ("^", input_values + i,
                                       input_values + i, forest_values_vec+i))
 
-            print(len(self.instrs))
             # this is 150 cycles each round
             # 256 elements in the vector, 3 parts of each hash stage, 6 hash stages
             # valu 6 slot limit + doing 8 at a time
@@ -698,7 +758,6 @@ class KernelBuilder:
                 self.add("debug", ("vcompare", input_values + i, [
                          (round, i + j, "hashed_val") for j in range(VLEN)]))
 
-            print(len(self.instrs))
             for i in range(0, batch_size, VLEN):
                 i_const = self.scratch_const(i)
                 # idx = 2*idx + (1 if val % 2 == 0 else 2)
@@ -774,9 +833,10 @@ class KernelBuilder:
         counts = {"valu": 0, "alu": 0, "load": 0,
                   "debug": 0, "flow": 0, "store": 0}
         for instr in instrs:
-            engine, = instr.keys()
-            counts[engine] = counts[engine]+1
+            for engine, _ops in instr.items():
+                counts[engine] = counts[engine]+1
         print(counts)
+        print(len(self.instrs))
 
 
 BASELINE = 147734
