@@ -223,7 +223,6 @@ class KernelBuilder:
             # does this mean we have unnecessary ops? if ordering matters then we must be
             # writing to something twice
             last_valu_op_idx = None
-            alus = []
             for i in range(len(valu_converted_instr["valu"])):
                 op = valu_converted_instr["valu"][-1-i]
                 if op[0] not in ["vbroadcast", "multiply_add"]:
@@ -337,7 +336,7 @@ class KernelBuilder:
 
     # all 3 vecs must be batch_size long
     # this only takes 80 cycles per call
-    def build_hash(self, input_values_vec, tmp_vec_1, tmp_vec_2, round, i, batch_size):
+    def build_hash(self, input_values_vec, tmp_vec_1, tmp_vec_2, round, i, batch_size, pre_computed_hash_mul):
         for hash_index, (op1, val1, op2, op3, val3) in enumerate[
             tuple[str, int, str, str, int]
         ](HASH_STAGES):
@@ -348,11 +347,14 @@ class KernelBuilder:
             # instead we can multiply input and add the result of the first add in the same op
             for j in range(0, batch_size, VLEN):
                 if hash_index % 2 == 0:
-                    self.add("valu", [(op1, tmp_vec_1 + j, input_values_vec + j,
-                                      self.scratch_vconst(val1)),
-                                      ("multiply_add", input_values_vec + j, input_values_vec + j, self.scratch_vconst(val3),
-                                      tmp_vec_1 + j)
-                                      ])
+                    # self.add("valu", [(op1, tmp_vec_1 + j, input_values_vec + j,
+                    #                   self.scratch_vconst(val1)),
+                    #                   ("multiply_add", input_values_vec + j, input_values_vec + j, self.scratch_vconst(val3),
+                    #                   tmp_vec_1 + j)
+                    #                   ])
+
+                    self.add("valu", [("multiply_add", input_values_vec+j, input_values_vec+j, pre_computed_hash_mul[hash_index], self.scratch_vconst(
+                        val1))])
                 else:
                     self.add("valu", [(op1, tmp_vec_1 + j, input_values_vec + j,
                                       self.scratch_vconst(val1)),
@@ -443,6 +445,16 @@ class KernelBuilder:
         four_const = self.scratch_const(4)
         five_const = self.scratch_const(5)
         six_const = self.scratch_const(6)
+
+        # hash ops 1 3 5 can be collapsed into 1 mul_add
+        pre_computed_hash_mul = []
+        for hash_index, (op1, val1, op2, op3, val3) in enumerate[
+            tuple[str, int, str, str, int]
+        ](HASH_STAGES):
+            if hash_index % 2 != 0:
+                pre_computed_hash_mul.append(None)
+                continue
+            pre_computed_hash_mul.append(self.scratch_vconst(1 + (1 << val3)))
 
         vlen_const = self.scratch_const(VLEN)
         self.add("alu", [
@@ -821,7 +833,7 @@ class KernelBuilder:
             # valu 6 slot limit + doing 8 at a time
             # -> 256 * 3 * 6 / (6*8) = 96
             self.build_hash(input_values, forest_values_p_vec,
-                            forest_values_vec, round, i, batch_size)
+                            forest_values_vec, round, i, batch_size, pre_computed_hash_mul)
             print(
                 f"round: {round}, stage: building hash, new instrs: {len(self.interim_instrs) - curr_interim_instrs}")
 
