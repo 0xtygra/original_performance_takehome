@@ -438,6 +438,9 @@ class Input:
 
 
 HASH_STAGES = [
+    # what we do is: op 1, val1 with input
+    # op3, val3 with input
+    # op2 the result of both
     ("+", 0x7ED55D16, "+", "*", 2**12),
     ("^", 0xC761C23C, "^", ">>", 19),
     ("+", 0x165667B1, "+", "*", 2**5),

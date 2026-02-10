@@ -19,6 +19,7 @@ We recommend you look through problem.py next.
 from collections import defaultdict
 import random
 import unittest
+import copy
 
 from problem import (
     Engine,
@@ -132,27 +133,27 @@ class KernelBuilder:
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
-    def place_op_in_earliest_available_cycle(self, engine, op, earliest_valid_cycle_idx):
-        for i in range(earliest_valid_cycle_idx, len(self.instrs)):
-            curr_instr = self.instrs[i]
+    def place_op_in_earliest_available_cycle(self, engine, op, earliest_valid_cycle_idx, instr_list):
+        for i in range(earliest_valid_cycle_idx, len(instr_list)):
+            curr_instr = instr_list[i]
             if engine not in curr_instr:
                 curr_instr[engine] = []
             if len(curr_instr[engine]) < SLOT_LIMITS[engine]:
-                self.instrs[i][engine].append(op)
-                return
-        self.instrs.append({engine: [op]})
-        return
+                instr_list[i][engine].append(op)
+                return instr_list
+        instr_list.append({engine: [op]})
+        return instr_list
 
     # TODO: make it a bit smarter such that we can put reads and writes in the same
     # cycle where possible
-    def build(self, debug=False):
-        self.instrs.append({})
-        for ii, (engine, op) in enumerate(self.interim_instrs):
+    def optimise_instrs(self, instrs):
+        initial_instrs = [{}]
+        for ii, (engine, op) in enumerate(instrs):
 
-            instrs_len = len(self.instrs)
+            instrs_len = len(initial_instrs)
             for i in range(instrs_len):
                 curr_idx = instrs_len-i-1
-                curr_cycle = self.instrs[curr_idx]
+                curr_cycle = initial_instrs[curr_idx]
                 curr_cycle_inputs = set()
                 curr_cycle_outputs = set()
                 for tmp_eng, instrs in curr_cycle.items():
@@ -160,29 +161,101 @@ class KernelBuilder:
                         curr_cycle_inputs, curr_cycle_outputs, tmp_eng, instrs)
                 # now we know all the inputs and outputs for our current cycle
                 # time to check if our current instruction has any conflicts
-                curr_instr_inputs = set()
-                curr_instr_outputs = set()
+                op_inputs = set()
+                op_outputs = set()
                 calc_cycle_inputs_outputs(
-                    curr_instr_inputs, curr_instr_outputs, engine, [op])
+                    op_inputs, op_outputs, engine, [op])
                 # our current instruction has an input that is mutated in this cycle -> CANT GO IN THIS CYCLE
-                if curr_instr_inputs & curr_cycle_outputs:
-                    self.place_op_in_earliest_available_cycle(
-                        engine, op, curr_idx+1)
+                if op_inputs & curr_cycle_outputs:
+                    initial_instrs = self.place_op_in_earliest_available_cycle(
+                        engine, op, curr_idx+1, initial_instrs)
                     break
-                if curr_instr_outputs & curr_cycle_inputs:
-                    self.place_op_in_earliest_available_cycle(
-                        engine, op, curr_idx)
+                if op_outputs & curr_cycle_outputs:
+                    initial_instrs = self.place_op_in_earliest_available_cycle(
+                        engine, op, curr_idx+1, initial_instrs)
+                    break
+                if op_outputs & curr_cycle_inputs:
+                    initial_instrs = self.place_op_in_earliest_available_cycle(
+                        engine, op, curr_idx, initial_instrs)
                     break
                 if engine == "flow" and op[0] == "pause":
-                    self.place_op_in_earliest_available_cycle(
-                        engine, op, curr_idx)
+                    initial_instrs = self.place_op_in_earliest_available_cycle(
+                        engine, op, curr_idx, initial_instrs)
                     break
                 # if we get here then we can go back further
                 # if this is the first cycle though then we gotta put it in
                 if curr_idx == 0:
-                    self.place_op_in_earliest_available_cycle(engine, op, 0)
+                    initial_instrs = self.place_op_in_earliest_available_cycle(
+                        engine, op, 0, initial_instrs)
                     break
+        return initial_instrs
 
+    def build(self, debug=False):
+        initial_instrs = self.optimise_instrs(self.interim_instrs)
+
+        # some of our cycles are weird
+        # for instr in initial_instrs:
+        #     if "valu" in instr:
+        #         valu_instr = instr["valu"]
+        #         outputs = {}
+        #         for i in range(len(valu_instr)):
+        #             op = valu_instr[i]
+        #             if op[1] not in outputs:
+        #                 outputs[op[1]] = []
+        #             outputs[op[1]].append(i)
+        #         for dest, idxs in outputs.items():
+        #             if len(idxs) > 1:
+        #                 print(outputs)
+        #                 print(valu_instr)
+        #             idxs_to_pop = idxs[:-1][::-1]
+        #             for idx in idxs_to_pop:
+        #                 instr["valu"].pop(idx)
+
+        # now go through instrs to see if we can replace alu with valu
+        valu_converted_instrs = []
+        for instr in initial_instrs:
+            valu_converted_instr = copy.deepcopy(instr)
+            if "valu" not in valu_converted_instr:
+                valu_converted_instrs.append(valu_converted_instr)
+                continue
+            # find the LAST convertible valu (cant convert vbroadcast or mul add)
+            # must be last as some of our cycles have internal ordering dependencies
+            # does this mean we have unnecessary ops? if ordering matters then we must be
+            # writing to something twice
+            last_valu_op_idx = None
+            alus = []
+            for i in range(len(valu_converted_instr["valu"])):
+                op = valu_converted_instr["valu"][-1-i]
+                if op[0] not in ["vbroadcast", "multiply_add"]:
+                    last_valu_op_idx = -1-i
+                    break
+            if last_valu_op_idx == None:
+                valu_converted_instrs.append(valu_converted_instr)
+                continue
+            if len(valu_converted_instr["valu"]) == SLOT_LIMITS["valu"] \
+                    and ("alu" not in valu_converted_instr):
+                # take a valu and convert to 8 alus
+                if "alu" not in valu_converted_instr:
+                    valu_converted_instr["alu"] = []
+                last_valu_op = valu_converted_instr["valu"].pop(
+                    last_valu_op_idx)
+                for j in range(VLEN):
+                    valu_converted_instr["alu"].append(
+                        (last_valu_op[0], last_valu_op[1]+j, last_valu_op[2]+j, last_valu_op[3]+j))
+            valu_converted_instrs.append(valu_converted_instr)
+
+        # re-flatten then go through again to rejig it
+        ops = []
+        for instr in valu_converted_instrs:
+            for engine, slots in instr.items():
+                for slot in slots:
+                    ops.append((engine, slot))
+
+        valu_converted_optimised_instrs = self.optimise_instrs(
+            ops)
+
+        self.instrs = valu_converted_instrs
+        # self.instrs = valu_converted_optimised_instrs
         return self.instrs
 
         # every op has inputs and outputs
