@@ -1,3 +1,7 @@
+Achieved just under 2000 cycles manually (no ai, no references). Ran out of time to continue working on it, lifted some ideas from [here](https://github.com/zolotukhin/original_performance_takehome_zolotukhin) to get to ~1500 cycles now, going to leave it here :). Was fun!
+
+
+Original readme below
 # Anthropic's Original Performance Take-Home
 
 This repo contains a version of Anthropic's original performance take-home, before Claude Opus 4.5 started doing better than humans given only 2 hours.
