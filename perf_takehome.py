@@ -284,6 +284,9 @@ class KernelBuilder:
         assert self.scratch_ptr <= SCRATCH_SIZE, "Out of scratch space"
         return addr
 
+    def alloc_vec(self, name=None):
+        return self.alloc_scratch(name, VLEN)
+
     def scratch_const(self, val, name=None):
         if val not in self.const_map:
             addr = self.alloc_scratch(name)
@@ -365,144 +368,94 @@ class KernelBuilder:
                                       ])
 
     def build_kernel(
-        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int, batch_chunk_size: int = 5
+        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int,
+        batch_chunk_size: int = 17, round_tile: int = 13
     ):
         """
         Like reference_kernel2 but building actual instructions.
         Scalar implementation using only scalar ALU and load/store.
         """
-        tmp1 = self.alloc_scratch("tmp1")
+        tmp_addr = self.alloc_scratch("tmp_addr")
+        tmp_addr_2 = self.alloc_scratch("tmp_addr_2")
+
         # Scratch space addresses
         init_vars = [
-            "rounds",
-            "n_nodes",
-            "batch_size",
-            "forest_height",
-            "forest_values_p",
-            "inp_indices_p",
-            "inp_values_p",
+            "rounds", "n_nodes", "batch_size", "forest_height",
+            "forest_values_p", "inp_indices_p", "inp_values_p",
         ]
-        init_vars_vec = ["forest_values_p", "n_nodes"]
         for v in init_vars:
-            if v not in init_vars_vec:
-                self.alloc_scratch(v, 1)
-            else:
-                self.alloc_scratch(v, VLEN)
+            self.alloc_scratch(v, 1)
+
+        tmp_init = self.alloc_scratch("tmp_init")
         for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            if v not in init_vars_vec:
-                self.add("load", ("load", self.scratch[v], tmp1))
-            else:
-                self.add("load", ("load", self.scratch[v], tmp1))
-                self.add(
-                    "valu", ("vbroadcast", self.scratch[v], self.scratch[v]))
+            self.add("load", ("const", tmp_init, i))
+            self.add("load", ("load", self.scratch[v], tmp_init))
 
         zero_vec_const = self.scratch_vconst(0)
         one_vec_const = self.scratch_vconst(1)
         two_vec_const = self.scratch_vconst(2)
+        one_const = self.scratch_const(1)
+
+        forest_vec = self.alloc_vec("v_forest_p")
+        self.add("valu", ("vbroadcast", forest_vec,
+                 self.scratch["forest_values_p"]))
+
         three_vec_const = self.scratch_vconst(3)
+        four_vec_const = self.scratch_vconst(4)
         seven_vec_const = self.scratch_vconst(7)
-        self.load_hash_values()
+
+        # we can keep the first 3 levels of the forest in memory
+        forest_node_scratch_vecs = []
+        num_forest_nodes_to_load = 15  # level 0,1,2,3
+        for node_idx in range(num_forest_nodes_to_load):
+            node_offset = self.scratch_const(node_idx)
+            node_scalar = self.alloc_scratch(f"node_{node_idx}")
+            node_vec = self.alloc_vec(f"v_node_{node_idx}")
+            # lets us better pack things so we can get 2 loads
+            addr_to_use = tmp_addr if node_idx % 2 == 0 else tmp_addr_2
+            self.add("alu", ("+", addr_to_use,
+                     self.scratch["forest_values_p"], node_offset))
+            self.add("load", ("load", node_scalar, addr_to_use))
+            self.add("valu", ("vbroadcast", node_vec, node_scalar))
+            forest_node_scratch_vecs.append(node_vec)
+
+        # hash ops 1 3 5 can be collapsed into 1 mul_add
+        hash_vec_consts1 = []
+        pre_computed_hash_mul = []
+        for op1, val1, op2, op3, val3 in HASH_STAGES:
+            hash_vec_consts1.append(self.scratch_vconst(val1))
+            if op1 == "+" and op2 == "+" and op3 == "<<":
+                pre_computed_hash_mul.append(
+                    self.scratch_vconst(1 + (1 << val3)))
+            else:
+                pre_computed_hash_mul.append(None)
+                self.scratch_vconst(val3)
+
+        assert batch_size % VLEN == 0
+        vecs_per_batch = batch_size // VLEN
+
+        input_indices = self.alloc_scratch("input_indices", batch_size)
+        input_values = self.alloc_scratch("input_values", batch_size)
+
+        offset = self.alloc_scratch("offset")
+        self.add("load", ("const", offset, 0))
+        vlen_const = self.scratch_const(VLEN)
 
         # Pause instructions are matched up with yield statements in the reference
         # kernel to let you debug at intermediate steps. The testing harness in this
         # file requires these match up to the reference kernel's yields, but the
         # submission harness ignores them.
         self.add("flow", ("pause",))
-        # Any debug engine instruction is ignored by the submission simulator
-        self.add("debug", ("comment", "Starting loop"))
 
-        # Scalar scratch registers
-        tmp_addr = self.alloc_scratch("tmp_addr")
-        tmp_addr_2 = self.alloc_scratch("tmp_addr_2")
-
-        # vec_batch_is = self.alloc_scratch("vec_batch_is", batch_size)
-        # for i in range(batch_size):
-        #         self.add("load", ("const", tmp1, i))
-        #         self.add("load", ("load", vec_batch_is + i, tmp1))
-
-        input_indices = self.alloc_scratch("input_indices", batch_size)
-        input_values = self.alloc_scratch("input_values", batch_size)
-        forest_level_0_val = self.alloc_scratch("forest_level_0_val")
-
-        self.add(
-            "load", [("load", forest_level_0_val, self.scratch["forest_values_p"])])
-        # keep all these contiguous, just feels right
-        for i in range(0, batch_size, VLEN*2):
-            if i+VLEN < batch_size:
-                self.scratch_double_const(i, i+VLEN)
-            else:
-                self.scratch_const(i)
-        # what im thinking: we initially compute 2 addresses, store in addr1 addr2
-        # then each round we: compute 2 more addresses (store them in same vars), and load 2
-        # then at the end, once, we load the last 2
-        zero_const = self.scratch_const(0)
-
-        # hash ops 1 3 5 can be collapsed into 1 mul_add
-        pre_computed_hash_mul = []
-        for hash_index, (op1, val1, op2, op3, val3) in enumerate[
-            tuple[str, int, str, str, int]
-        ](HASH_STAGES):
-            if hash_index % 2 != 0:
-                pre_computed_hash_mul.append(None)
-                continue
-            pre_computed_hash_mul.append(self.scratch_vconst(1 + (1 << val3)))
-
-        vlen_const = self.scratch_const(VLEN)
-        self.add("alu", [
-            ("+", tmp_addr_2, self.scratch["inp_values_p"], zero_const),
-            ("+", tmp_addr, self.scratch["inp_values_p"], vlen_const),
-        ])
-        self.add("valu", [
-            ("vbroadcast", input_indices, zero_const),
-            ("vbroadcast", input_indices + VLEN, zero_const),
-        ])
-
-        # now we initially have tmp_addr and tmp_addr_2 populated
-        for i in range(0, batch_size-VLEN*2, VLEN*2):
-            i_const = self.scratch_const(i+VLEN*2)
-            i_2nd_const = self.scratch_const(i+VLEN*3)
-
-            self.add("load", [
-                ("vload", input_values + i, tmp_addr_2),
-                ("vload", input_values + i + VLEN, tmp_addr),
-            ])
-
-            self.add("alu", [
-                ("+", tmp_addr_2, self.scratch["inp_values_p"], i_const),
-                ("+", tmp_addr, self.scratch["inp_values_p"], i_2nd_const),
-            ])
-            self.add("valu", [
-                ("vbroadcast", input_indices+i+2*VLEN, zero_const),
-                ("vbroadcast", input_indices+i+3*VLEN, zero_const),
-            ]
-            )
-
-        final_offset = batch_size-VLEN*2
-        self.add("load", [
-            ("vload", input_values + final_offset, tmp_addr_2),
-            ("vload", input_values + final_offset + VLEN, tmp_addr),
-        ])
-        # theoretically at this point we now have all of our input indices and values in 2 256 contiguous blocks of memory
-
-        # we can keep the first 3 levels of the forest in memory
-        forest_node_scratch_vecs = []
-        num_forest_nodes_to_load = 15  # level 0,1,2,3
-        for i in range(num_forest_nodes_to_load):
-            node_idx = self.scratch_const(i)
-            forest_node_vec = self.alloc_scratch(f"forest_node_{i}", VLEN)
-            # lets us better pack things so we can get 2 loads
-            addr_to_use = tmp_addr if i % 2 == 0 else tmp_addr_2
-            self.add("alu", ("+", addr_to_use, node_idx,
-                     self.scratch["forest_values_p"]))
-            self.add("load", [
-                ("load", forest_node_vec, addr_to_use)
-            ])
+        for block in range(vecs_per_batch):
             self.add(
-                "valu", [("vbroadcast", forest_node_vec, forest_node_vec)])
-            forest_node_scratch_vecs.append(forest_node_vec)
+                "alu", ("+", tmp_addr, self.scratch["inp_indices_p"], offset))
+            self.add("load", ("vload", input_indices + block * VLEN, tmp_addr))
+            self.add(
+                "alu", ("+", tmp_addr, self.scratch["inp_values_p"], offset))
+            self.add("load", ("vload", input_values + block * VLEN, tmp_addr))
+            self.add("alu", ("+", offset, offset, vlen_const))
 
-        vecs_per_batch = batch_size//VLEN
         chunk_scratch_memory = []
         for i in range(batch_chunk_size):
             chunk_scratch_memory.append({
@@ -511,169 +464,130 @@ class KernelBuilder:
                 "tmp2": self.alloc_scratch(f"tmp2{i}", VLEN),
                 "tmp3": self.alloc_scratch(f"tmp3{i}", VLEN),
             })
+
         for chunk_start in range(0, vecs_per_batch, batch_chunk_size):
-            for round in range(rounds):
+            for round_start in range(0, rounds, round_tile):
+                round_end = min(rounds, round_start + round_tile)
                 for sub_chunk in range(batch_chunk_size):
-                    chunk = sub_chunk + chunk_start
+                    chunk = chunk_start + sub_chunk
+                    if chunk >= vecs_per_batch:
+                        break
                     chunk_memory = chunk_scratch_memory[sub_chunk]
                     indices = input_indices + chunk * VLEN
                     values = input_values + chunk * VLEN
-                    level = round % (forest_height+1)
 
-                    # saves us 500 cycles
-                    curr_interim_instrs = len(self.interim_instrs)
-                    if level == 0:
-                        forest_values_l_0 = forest_node_scratch_vecs[0]
-                        self.add("valu", ("^", values,
-                                          values, forest_values_l_0))
-                    elif level == 1:
-                        self.add(
-                            "valu", ("&", chunk_memory["tmp1"], indices, values))
-                        self.add(
-                            "flow",
-                            ("vselect", chunk_memory["node"], chunk_memory["tmp1"],
-                             forest_node_scratch_vecs[1], forest_node_scratch_vecs[2]),
-                        )
-                        self.add("valu", ("^", values,
-                                          values, chunk_memory["node"]))
-                    elif level == 2:
-                        self.add(
-                            "valu", ("-", chunk_memory["tmp1"], indices, three_vec_const))
-                        self.add(
-                            "valu", ("&", chunk_memory["tmp2"], chunk_memory["tmp1"], one_vec_const))
-                        self.add(
-                            "valu", ("&", chunk_memory["node"], chunk_memory["tmp1"], two_vec_const))
-                        self.add(
-                            "flow",
-                            ("vselect", chunk_memory["tmp1"], chunk_memory["tmp2"],
-                             forest_node_scratch_vecs[4], forest_node_scratch_vecs[3]),
-                        )
-                        self.add(
-                            "flow",
-                            ("vselect", chunk_memory["tmp2"], chunk_memory["tmp2"],
-                             forest_node_scratch_vecs[6], forest_node_scratch_vecs[5]),
-                        )
-                        self.add(
-                            "flow",
-                            ("vselect", chunk_memory["node"], chunk_memory["node"],
-                             chunk_memory["tmp2"], chunk_memory["tmp1"]),
-                        )
-                        self.add("valu", ("^", values,
-                                          values, chunk_memory["node"]))
-                    else:
-                        self.add("valu", ("+", chunk_memory["tmp1"],
-                                          self.scratch["forest_values_p"], indices))
-                        for j in range(VLEN):
+                    for round in range(round_start, round_end):
+                        level = round % (forest_height + 1)
+
+                        if level == 0:
+                            self.add("valu", ("^", values, values,
+                                     forest_node_scratch_vecs[0]))
+                        elif level == 1:
                             self.add(
-                                "load", ("load", chunk_memory["node"] + j, chunk_memory["tmp1"] + j))
-                        self.add("valu", ("^", values,
-                                          values, chunk_memory["node"]))
-                    print(
-                        f"round: {round}, stage: loading and xoring forest values, new instrs: {len(self.interim_instrs) - curr_interim_instrs}")
+                                "valu", ("&", chunk_memory["tmp1"], indices, one_vec_const))
+                            self.add(
+                                "flow", ("vselect", chunk_memory["node"], chunk_memory["tmp1"], forest_node_scratch_vecs[1], forest_node_scratch_vecs[2]))
+                            self.add(
+                                "valu", ("^", values, values, chunk_memory["node"]))
+                        elif level == 2:
+                            self.add(
+                                "valu", ("-", chunk_memory["tmp1"], indices, three_vec_const))
+                            self.add(
+                                "valu", ("&", chunk_memory["tmp2"], chunk_memory["tmp1"], one_vec_const))
+                            self.add(
+                                "valu", ("&", chunk_memory["node"], chunk_memory["tmp1"], two_vec_const))
+                            self.add(
+                                "flow", ("vselect", chunk_memory["tmp1"], chunk_memory["tmp2"], forest_node_scratch_vecs[4], forest_node_scratch_vecs[3]))
+                            self.add(
+                                "flow", ("vselect", chunk_memory["tmp2"], chunk_memory["tmp2"], forest_node_scratch_vecs[6], forest_node_scratch_vecs[5]))
+                            self.add(
+                                "flow", ("vselect", chunk_memory["node"], chunk_memory["node"], chunk_memory["tmp2"], chunk_memory["tmp1"]))
+                            self.add(
+                                "valu", ("^", values, values, chunk_memory["node"]))
+                        elif level == 3:
+                            self.add(
+                                "valu", ("-", chunk_memory["tmp1"], indices, seven_vec_const))
+                            self.add(
+                                "valu", ("&", chunk_memory["tmp2"], chunk_memory["tmp1"], one_vec_const))
+                            self.add(
+                                "valu", ("&", chunk_memory["tmp3"], chunk_memory["tmp1"], two_vec_const))
 
-                    curr_interim_instrs = len(self.interim_instrs)
-                    # this is 150 cycles each round
-                    # 256 elements in the vector, 3 parts of each hash stage, 6 hash stages
-                    # valu 6 slot limit + doing 8 at a time
-                    # -> 256 * 3 * 6 / (6*8) = 96
-                    for hash_index, (op1, val1, op2, op3, val3) in enumerate[
-                        tuple[str, int, str, str, int]
-                    ](HASH_STAGES):
+                            self.add(
+                                "flow", ("vselect", chunk_memory["node"], chunk_memory["tmp2"], forest_node_scratch_vecs[8], forest_node_scratch_vecs[7]))
+                            self.add(
+                                "flow", ("vselect", chunk_memory["tmp1"], chunk_memory["tmp2"], forest_node_scratch_vecs[10], forest_node_scratch_vecs[9]))
+                            self.add(
+                                "flow", ("vselect", chunk_memory["tmp1"], chunk_memory["tmp3"], chunk_memory["tmp1"], chunk_memory["node"]))
+
+                            self.add("flow", ("vselect", chunk_memory["node"], chunk_memory["tmp2"],
+                                     forest_node_scratch_vecs[12], forest_node_scratch_vecs[11]))
+                            self.add("flow", ("vselect", chunk_memory["tmp2"], chunk_memory["tmp2"],
+                                     forest_node_scratch_vecs[14], forest_node_scratch_vecs[13]))
+                            self.add(
+                                "flow", ("vselect", chunk_memory["node"], chunk_memory["tmp3"], chunk_memory["tmp2"], chunk_memory["node"]))
+
+                            self.add(
+                                "valu", ("-", chunk_memory["tmp2"], indices, seven_vec_const))
+                            self.add(
+                                "valu", ("&", chunk_memory["tmp2"], chunk_memory["tmp2"], four_vec_const))
+                            self.add(
+                                "flow", ("vselect", chunk_memory["node"], chunk_memory["tmp2"], chunk_memory["node"], chunk_memory["tmp1"]))
+                            self.add(
+                                "valu", ("^", values, values, chunk_memory["node"]))
+                        else:
+                            self.add(
+                                "valu", ("+", chunk_memory["tmp1"], forest_vec, indices))
+                            for lane in range(VLEN):
+                                self.add(
+                                    "load", ("load", chunk_memory["node"] + lane, chunk_memory["tmp1"] + lane))
+                            self.add(
+                                "valu", ("^", values, values, chunk_memory["node"]))
+
                         # 0 2 4 are all mul add
                         # 1 3 5 unchanges
-                        # before we had 2 stage 1s for every stage 2, now we have 1 2 1 2 1 2 stage 1s for 6 stage 2s = 9 for 6
                         # these stages: add input and val1, left shift (multiply) input by val3, then add the results of both
                         # instead we can multiply input and add the result of the first add in the same op
-                        if hash_index % 2 == 0:
-                            self.add("valu", [("multiply_add", values, values, pre_computed_hash_mul[hash_index], self.scratch_vconst(
-                                val1))])
-                        else:
-                            self.add("valu", [(op1, chunk_memory["tmp1"], values,
-                                               self.scratch_vconst(val1)),
-                                              (op3, chunk_memory["tmp2"], values,
-                                               self.scratch_vconst(val3)),
-                                              (op2, values,
-                                               chunk_memory["tmp1"], chunk_memory["tmp2"])
-                                              ])
-                    # self.build_hash(input_values, forest_values_p_vec,
-                    #                 forest_values_vec, round, i, batch_size, pre_computed_hash_mul)
-                    print(
-                        f"round: {round}, stage: building hash, new instrs: {len(self.interim_instrs) - curr_interim_instrs}")
+                        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                            mul_vec = pre_computed_hash_mul[hi]
+                            if mul_vec is not None:
+                                self.add("valu", ("multiply_add", values,
+                                         values, mul_vec, hash_vec_consts1[hi]))
+                            else:
+                                self.add(
+                                    "valu", (op1, chunk_memory["tmp1"], values, hash_vec_consts1[hi]))
+                                self.add(
+                                    "valu", (op3, chunk_memory["tmp2"], values, self.vconst_map[val3]))
+                                self.add(
+                                    "valu", (op2, values, chunk_memory["tmp1"], chunk_memory["tmp2"]))
 
-                    for i in range(0, batch_size, VLEN):
-                        self.add("debug", ("vcompare", input_values + i, [
-                                (round, i + j, "hashed_val") for j in range(VLEN)]))
-
-                    curr_interim_instrs = len(self.interim_instrs)
-                    # this does almost nothing lmao saves us like 50 cycles
-                    if round == forest_height and False:
-                        for i in range(0, batch_size, VLEN):
+                        # idx = 2*idx + (1 + val&1)
+                        if level == forest_height:
                             self.add(
-                                "valu", ("vbroadcast", input_indices+i, zero_vec_const))
-                    else:
-                        self.add(
-                            "valu", ("&",
-                                     chunk_memory["tmp1"], values, one_vec_const)
-                        )
-                        self.add(
-                            "valu",
-                                ("+", chunk_memory["node"],
-                                 chunk_memory["tmp1"], one_vec_const),
-                        )
-                        self.add(
-                            "valu", ("multiply_add", indices, indices,
-                                     two_vec_const, chunk_memory["node"])
-                        )
-
-                        # i_const = self.scratch_const(i)
-                        # self.add("flow", ("vselect", input_indices+i,
-                        #                                    tmp_vec_batch_size + i, input_indices+i, zero_vec_const))
-                        self.add("debug", ("vcompare", indices,
-                                           (round, chunk * VLEN, "wrapped_idx")))
-
-                        # mem[inp_indices_p + i] = idx
-                    print(
-                        f"round: {round}, stage: calc and wrapping next index, new instrs: {len(self.interim_instrs) - curr_interim_instrs}")
+                                "valu", ("+", indices, zero_vec_const, zero_vec_const))
+                        else:
+                            self.add(
+                                "valu", ("&", chunk_memory["tmp1"], values, one_vec_const))
+                            self.add(
+                                "valu", ("+", chunk_memory["node"], chunk_memory["tmp1"], one_vec_const))
+                            self.add("valu", ("multiply_add", indices,
+                                     indices, two_vec_const, chunk_memory["node"]))
 
         # Required to match with the yield in reference_kernel2
-        i_const = self.scratch_const(0)
-        self.add("alu", [("+", tmp_addr, self.scratch["inp_indices_p"],
-                          i_const), ("+", tmp_addr_2, self.scratch["inp_values_p"], i_const)])
-
         # WE NEED TO VSTORE AT THE input_indices_p and input_values_p
-        # now we initially have tmp_addr and tmp_addr_2 populated
-        for i in range(0, batch_size-VLEN, VLEN):
-            i_const = self.scratch_const(i+VLEN)
+        self.add("load", ("const", offset, 0))
+        for block in range(vecs_per_batch):
+            self.add(
+                "alu", ("+", tmp_addr, self.scratch["inp_indices_p"], offset))
+            self.add("store", ("vstore", tmp_addr,
+                     input_indices + block * VLEN))
+            self.add(
+                "alu", ("+", tmp_addr, self.scratch["inp_values_p"], offset))
+            self.add("store", ("vstore", tmp_addr, input_values + block * VLEN))
+            self.add("alu", ("+", offset, offset, vlen_const))
 
-            self.add("store", [
-                ("vstore", tmp_addr, input_indices + i),
-                ("vstore", tmp_addr_2, input_values + i)
-            ])
-            self.add("alu", [
-                ("+", tmp_addr, self.scratch["inp_indices_p"],
-                 i_const), ("+", tmp_addr_2, self.scratch["inp_values_p"], i_const)]
-            )
-
-        final_offset = batch_size-VLEN
-        self.add("store", [
-            ("vstore", tmp_addr, input_indices + final_offset),
-            ("vstore", tmp_addr_2, input_values + final_offset)
-        ])
         self.add("flow", ("pause",))
 
-        instrs = self.build(True, False)
-        cycle_counts = {"valu": 0, "alu": 0, "load": 0,
-                        "debug": 0, "flow": 0, "store": 0}
-        engine_counts = {"valu": 0, "alu": 0, "load": 0,
-                         "debug": 0, "flow": 0, "store": 0}
-        for instr in instrs:
-            for engine, ops in instr.items():
-                cycle_counts[engine] = cycle_counts[engine]+1
-                for _op in ops:
-                    engine_counts[engine] = engine_counts[engine]+1
-        print(cycle_counts)
-        print(engine_counts)
-        print(len(self.instrs))
+        self.build(True, True)
 
 
 BASELINE = 147734
@@ -750,17 +664,9 @@ class Tests(unittest.TestCase):
         # Full-scale example for performance testing
         do_kernel_test(10, 16, 256, trace=True, prints=False)
 
-    # Passing this test is not required for submission, see submission_tests.py for the actual correctness test
-    # You can uncomment this if you think it might help you debug
-    # def test_kernel_correctness(self):
-    #     for batch in range(1, 3):
-    #         for forest_height in range(3):
-    #             do_kernel_test(
-    #                 forest_height + 2, forest_height + 4, batch * 16 * VLEN * N_CORES
-    #             )
-
     def test_kernel_cycles(self):
         do_kernel_test(10, 16, 256)
+
 
 # To run all the tests:
 #    python perf_takehome.py
